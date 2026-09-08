@@ -143,7 +143,7 @@ jobs:
           # Bracket-index the hyphenated input so the || fallback is unambiguous.
           interest-id: ${{ inputs['interest-id'] || 'ef7dce1d-cd38-4cb3-b76d-3c1707972109' }}
           # remyx[bot] token (empty → action falls back to GITHUB_TOKEN).
-          github-token: ${{ steps.remyx-bot.outputs.token }}
+          github-token: ${{ secrets.PUSH_PAT || steps.remyx-bot.outputs.token }}
           # Disable the per-repo rate-limit window so manual and scheduled
           # runs always evaluate the latest recommendation. Per-paper dedup
           # (open PR / Issue for the same arxiv_id) still prevents duplicates.
