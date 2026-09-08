@@ -82,7 +82,7 @@ concurrency:
 jobs:
   recommend:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 150
     permissions:
       contents: write
       pull-requests: write
@@ -109,12 +109,12 @@ jobs:
               echo "ANTHROPIC_AUTH_TOKEN=$ZAI_API_KEY_SECRET" >> "$GITHUB_ENV"
               echo "ANTHROPIC_BASE_URL=https://api.z.ai/api/anthropic" >> "$GITHUB_ENV"
               echo "base_url=https://api.z.ai/api/anthropic" >> "$GITHUB_OUTPUT"
-              echo "timeout=3600" >> "$GITHUB_OUTPUT" ;;
+              echo "timeout=7200" >> "$GITHUB_OUTPUT" ;;
             moonshot)
               echo "ANTHROPIC_AUTH_TOKEN=$MOONSHOT_API_KEY_SECRET" >> "$GITHUB_ENV"
               echo "ANTHROPIC_BASE_URL=https://api.moonshot.ai/anthropic" >> "$GITHUB_ENV"
               echo "base_url=https://api.moonshot.ai/anthropic" >> "$GITHUB_OUTPUT"
-              echo "timeout=3600" >> "$GITHUB_OUTPUT" ;;
+              echo "timeout=7200" >> "$GITHUB_OUTPUT" ;;
             *)
               echo "ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY_SECRET" >> "$GITHUB_ENV"
               echo "base_url=" >> "$GITHUB_OUTPUT"
