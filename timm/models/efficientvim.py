@@ -757,7 +757,10 @@ def _cfg(**kwargs: Any) -> Dict[str, Any]:
         'num_classes': 1000, 'input_size': (3, 224, 224), 'pool_size': (4, 4),
         'crop_pct': 0.95, 'interpolation': 'bicubic',
         'mean': IMAGENET_DEFAULT_MEAN, 'std': IMAGENET_DEFAULT_STD,
-        'first_conv': 'patch_embed.conv.0.conv', 'classifier': 'heads.3',
+        'first_conv': 'patch_embed.conv.0.conv',
+        # all four fusion heads are num_classes-sized -- list them so timm resets every one on a
+        # num_classes change (a single 'heads.3' leaves heads.0..2 mismatched on transfer).
+        'classifier': ('heads.0', 'heads.1', 'heads.2', 'heads.3'),
         'origin_url': 'https://github.com/mlvlab/EfficientViM', 'license': 'mit',
         **kwargs,
     }
@@ -765,47 +768,51 @@ def _cfg(**kwargs: Any) -> Dict[str, Any]:
 
 default_cfgs = generate_default_cfgs({
     'efficientvim_m1.e300_in1k': _cfg(
-        hf_hub_id='timm/',
+        hf_hub_id='remyxai/efficientvim_m1.e300_in1k',
     ),
     'efficientvim_m1.e450_in1k': _cfg(
-        hf_hub_id='timm/',
+        hf_hub_id='remyxai/efficientvim_m1.e450_in1k',
     ),
     'efficientvim_m1_dist.in1k': _cfg(
-        hf_hub_id='timm/',
-        classifier=('heads.3', 'heads_dist.3'),
+        hf_hub_id='remyxai/efficientvim_m1_dist.in1k',
+        classifier=('heads.0', 'heads.1', 'heads.2', 'heads.3',
+                    'heads_dist.0', 'heads_dist.1', 'heads_dist.2', 'heads_dist.3'),
     ),
     'efficientvim_m2.e300_in1k': _cfg(
-        hf_hub_id='timm/',
+        hf_hub_id='remyxai/efficientvim_m2.e300_in1k',
     ),
     'efficientvim_m2.e450_in1k': _cfg(
-        hf_hub_id='timm/',
+        hf_hub_id='remyxai/efficientvim_m2.e450_in1k',
     ),
     'efficientvim_m2_dist.in1k': _cfg(
-        hf_hub_id='timm/',
-        classifier=('heads.3', 'heads_dist.3'),
+        hf_hub_id='remyxai/efficientvim_m2_dist.in1k',
+        classifier=('heads.0', 'heads.1', 'heads.2', 'heads.3',
+                    'heads_dist.0', 'heads_dist.1', 'heads_dist.2', 'heads_dist.3'),
     ),
     'efficientvim_m3.e300_in1k': _cfg(
-        hf_hub_id='timm/',
+        hf_hub_id='remyxai/efficientvim_m3.e300_in1k',
     ),
     'efficientvim_m3.e450_in1k': _cfg(
-        hf_hub_id='timm/',
+        hf_hub_id='remyxai/efficientvim_m3.e450_in1k',
     ),
     'efficientvim_m3_dist.in1k': _cfg(
-        hf_hub_id='timm/',
-        classifier=('heads.3', 'heads_dist.3'),
+        hf_hub_id='remyxai/efficientvim_m3_dist.in1k',
+        classifier=('heads.0', 'heads.1', 'heads.2', 'heads.3',
+                    'heads_dist.0', 'heads_dist.1', 'heads_dist.2', 'heads_dist.3'),
     ),
     'efficientvim_m4.e300_in1k': _cfg(
-        hf_hub_id='timm/',
+        hf_hub_id='remyxai/efficientvim_m4.e300_in1k',
         input_size=(3, 256, 256), pool_size=(4, 4),
     ),
     'efficientvim_m4.e450_in1k': _cfg(
-        hf_hub_id='timm/',
+        hf_hub_id='remyxai/efficientvim_m4.e450_in1k',
         input_size=(3, 256, 256), pool_size=(4, 4),
     ),
     'efficientvim_m4_dist.in1k': _cfg(
-        hf_hub_id='timm/',
+        hf_hub_id='remyxai/efficientvim_m4_dist.in1k',
         input_size=(3, 256, 256), pool_size=(4, 4),
-        classifier=('heads.3', 'heads_dist.3'),
+        classifier=('heads.0', 'heads.1', 'heads.2', 'heads.3',
+                    'heads_dist.0', 'heads_dist.1', 'heads_dist.2', 'heads_dist.3'),
     ),
 })
 
