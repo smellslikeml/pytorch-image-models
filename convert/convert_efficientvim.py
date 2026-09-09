@@ -42,7 +42,10 @@ def main() -> None:
     args = parser.parse_args()
 
     model = timm.create_model(args.model, pretrained=False)
-    state_dict = torch.load(args.checkpoint, map_location='cpu', weights_only=True)
+    # weights_only=False: the released .pth are training checkpoints whose envelope carries
+    # non-tensor objects (optimizer / lr_scheduler / config), which weights_only=True rejects.
+    # These are the authors' own checkpoints from a trusted source.
+    state_dict = torch.load(args.checkpoint, map_location='cpu', weights_only=False)
     state_dict = checkpoint_filter_fn(state_dict, model)
 
     result = model.load_state_dict(state_dict, strict=True)

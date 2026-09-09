@@ -734,11 +734,16 @@ def checkpoint_filter_fn(
     """Map upstream EfficientViM checkpoints onto this module's names.
 
     Module names are kept identical to the reference implementation, so no key remapping is
-    needed -- only unwrapping a Lightning-style `state_dict` envelope and, for the
-    non-distilled model, dropping the tensors of the parallel distillation head.
+    needed -- only unwrapping the training-checkpoint envelope and, for the non-distilled
+    model, dropping the tensors of the parallel distillation head. The released checkpoints
+    nest the weights under `model` (final) and `model_ema` (EMA); the EMA weights match the
+    paper's reported top-1, so they are preferred when present.
     """
     if 'patch_embed.conv.0.conv.weight' not in state_dict:
-        state_dict = state_dict.get('state_dict', state_dict)
+        for envelope_key in ('model_ema', 'model', 'state_dict'):
+            if isinstance(state_dict.get(envelope_key), dict):
+                state_dict = state_dict[envelope_key]
+                break
     if not isinstance(model, EfficientViMDistilled):
         # distilled tensors have no target module, loading would report them unexpected
         state_dict = {
