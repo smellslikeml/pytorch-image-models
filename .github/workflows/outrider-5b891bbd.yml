@@ -20,7 +20,7 @@ name: Outrider
 # value.
 #
 # Baked defaults (this repo's agent config): agent=claude
-# provider=anthropic model=(provider default) — a
+# provider=zai model=glm-5.3 — a
 # workflow_dispatch can override all three per run (that's how a two-tier
 # refiner dispatches its promotions).
 
@@ -43,7 +43,7 @@ on:
         description: 'Which model backend to route the agent at. The action picks the matching secret, endpoint and auth style from its own registry.'
         type: choice
         required: false
-        default: 'anthropic'
+        default: 'zai'
         options:
           - anthropic
           - custom
@@ -163,7 +163,7 @@ jobs:
           # misconfiguration there is — a dispatch that changed `provider`
           # alone used to send the previous vendor's model id and fail on
           # "that model may not exist".
-          model: ${{ inputs.model || (inputs.provider == 'anthropic' && '' || '') }}
+          model: ${{ inputs.model || (inputs.provider == 'zai' && 'glm-5.3' || '') }}
           # Empty = the endpoint the action resolves for the provider. Set it
           # for a self-hosted model, a proxy, or an on-prem gateway.
           model-base-url: ${{ inputs['base-url'] }}
