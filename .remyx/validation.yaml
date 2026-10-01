@@ -1,0 +1,117 @@
+question:
+  kind: capability
+  ask: "Do all four released overlock_{xt,t,s,b}_in1k_224.pth checkpoints load into the natten-free timm port with zero missing/unexpected keys after checkpoint_filter_fn, and do the port's logits match a freshly-built natten reference within atol=1e-3?"
+baseline: none
+loop:
+  max_iterations: 8
+  fix_code: true
+benchmarks:
+  - name: overlock-weight-parity
+    suite:
+      notebook:
+        path: "eval/eval_overlock_weight_parity.ipynb"
+        packages: [natten, datasets]
+    scorer: max_abs_logit_diff_vs_natten_ref
+    metrics:
+      - name: max_abs_logit_diff_vs_natten_ref
+        direction: min
+        threshold: 0.001
+        role: target
+        bar: goal
+        reads_as: "worst-case |port logit minus natten-reference logit| across all four variants on the fixed fp32 batch; must sit under 1e-3"
+        # atol=1e-3 fixed by user_guidance; expected fp32 reassociation drift over <=361-term neighborhood sums is ~1e-6..1e-5, orders below the band
+      - name: missing_keys_after_filter
+        direction: min
+        threshold: 0.5
+        role: guardrail
+        bar: goal
+        reads_as: "checkpoint parameters the port lacks after checkpoint_filter_fn (integer count summed over all four variants); any nonzero value is a porting bug"
+        # the value is a non-negative integer, so the ONLY integer satisfying <= 0.5 is 0: the bound
+        # is exactly 'zero missing keys across all four released checkpoints', which is the correct
+        # behaviour fixed by user_guidance (na2d_av/iGEMM are parameter-free, so the port key set
+        # must equal the checkpoint modulo the aux_head drop). It fails on 1+ and on the pre-PR
+        # degraded sentinel (1) -- a real bound, not a vacuous '>= 0'.
+      - name: unexpected_keys_after_filter
+        direction: min
+        threshold: 0.5
+        role: guardrail
+        bar: goal
+        reads_as: "checkpoint keys the port does not consume after filtering (aux_head already dropped); integer count over all four variants; any nonzero value is a bug"
+        # same anchoring: integer count, the only passing value is 0 (exact key parity after the
+        # documented aux_head drop); a single stray key (1) or the degraded sentinel (1) fails it
+      - name: argmax_agreement_frac
+        direction: max
+        threshold: 1.0
+        role: diagnostic
+        reads_as: "fraction of batch positions where port and natten reference pick the same class; 1.0 expected, a flip only means near-ties"
+      - name: aux_head_keys_dropped
+        direction: max
+        threshold: 1
+        role: diagnostic
+        reads_as: "training-only aux_head.* keys dropped by checkpoint_filter_fn on the real checkpoints, proving the filter ran on them rather than a toy dict"
+        # every released in1k checkpoint carries the deep-supervision aux head, so correct behaviour
+        # drops at least one aux_head key; 0 -- also the degraded-sentinel value -- means the filter
+        # never ran on the real checkpoints and fails this bound
+      - name: overlock_xt_top1
+        direction: max
+        threshold: 81.9
+        role: diagnostic
+        reads_as: "overlock_xt top-1 in percent on the ImageNet-1k val shard with timm default_cfg preprocessing; -1.0 means no shard was obtainable"
+        # floor 81.9 = assumed paper XT row 82.2 minus 0.3pp (paper table row NOT visible in context; diagnostic only, never gates)
+      - name: imagenet_shard_n
+        direction: max
+        threshold: 1
+        role: diagnostic
+        reads_as: "number of ImageNet-1k val images actually scored; >= 1 makes overlock_xt_top1 a real measurement, 0 means the shard was unavailable"
+        # full mode asks for SHARD_N=2048 images; >= 1 distinguishes 'a real accuracy measurement'
+        # from the top1=-1.0 sentinel. 0 is an accepted best-effort outcome (user guidance: 'if
+        # available') and never gates: this metric is a diagnostic, not a target or guardrail.
+    policy:
+      guardrail_veto: true
+compute:
+  tier: gpu
+  # one arm: 4 checkpoint downloads (~0.85 GB from GitHub release v1) + 4 port builds + 4 reference builds
+  # + B=4 fp32 224x224 forwards through both models ≈ 15 min; pip natten ≤10 min (wheel) up to ~40 min (source build);
+  # optional ~2048-image streaming ImageNet-1k val shard ≈ 20 min -> 7200 s budget
+  timeout_s: 7200
+held_constant:
+  - "identical fixed input batch (seeded torch.randn, 224x224, fp32, cudnn.deterministic=True, benchmark=False) through port and natten reference, so preprocessing is pinned by construction"
+  - "same released checkpoint file per variant (GitHub release v1 URL wired into pretrained_cfg) feeds both the port and the reference"
+  - "both models eval() + inference_mode, fp32, same CUDA device, same strict-load policy after dropping training-only aux_head.* keys"
+  - "optional shard scored with timm default_cfg preprocessing (crop_pct, interpolation, mean/std)"
+avoid:
+  - "reference LMMMEng/OverLoCK cloned at branch main since no commit is visible in context; its HEAD sha is printed as a diagnostic, not pinned"
+  - "natten installed unpinned from PyPI (no version visible in context); a torch/cuda wheel mismatch may force a long source build"
+  - "ImageNet-1k shard streamed at the dataset repo's default revision (no hash visible in context; inventing one would 404) — diagnostic only, never gates"
+  - "no wall-clock timing anywhere — parity, key counts and accuracy only"
+  - "ImageNet shard acquisition is best-effort per the user's 'if available'; failure yields imagenet_shard_n=0 and top1=-1.0 and must not fail the gate metrics (traceback still printed to stderr)"
+  - "on a pre-PR baseline checkout both PR-added overlock modules are absent: timm.models.overlock and models.overlock each fail their defensive import cleanly (ImportError/AttributeError only) and the run prints degraded sentinels (max_diff=1.0, missing=unexpected=1, agreement=0.0) that fail every gate rather than crashing; no other handler swallows measurement errors"
+  - "guardrails encode exact-zero key parity as <= 0.5 on the integer counts (only 0 passes; 1+ and the degraded sentinel fail), fixed by user_guidance; the pre-filter aux_head drop is expected and reported via aux_head_keys_dropped (>= 1 proves the filter ran on the real checkpoints)"
+provenance:
+  max_abs_logit_diff_vs_natten_ref: "user_guidance"
+  missing_keys_after_filter: "user_guidance"
+  unexpected_keys_after_filter: "user_guidance"
+  overlock_xt_top1: "user_guidance"
+  argmax_agreement_frac: "inferred"
+  aux_head_keys_dropped: "inferred"
+  imagenet_shard_n: "inferred"
+  held_constant: "user_guidance"
+  suite: "synthesized"
+  compute: "user_guidance"
+report:
+  headline: "All four released checkpoints load clean into the natten-free port and its logits sit inside the 1e-3 band of the natten reference"
+  findings:
+    - "Worst |port minus natten| logit gap across overlock_{xt,t,s,b} on the fixed batch: {max_abs_logit_diff_vs_natten_ref} (gate 1e-3)"
+    - "After checkpoint_filter_fn: {missing_keys_after_filter} missing and {unexpected_keys_after_filter} unexpected keys (gate: both exactly 0, encoded as <= 0.5 on the integer count)"
+    - "Argmax agreement with the natten reference on the fixed batch: {argmax_agreement_frac:%}"
+    - "Training-only aux_head.* keys dropped by the filter on the real checkpoints: {aux_head_keys_dropped}"
+    - "overlock_xt top-1 on {imagenet_shard_n} ImageNet-1k val images: {overlock_xt_top1} percent (paper XT row assumed 82.2, band 0.3pp, -1.0 means no shard)"
+  establishes:
+    - "F.unfold + replicate-pad value aggregation computes the same function as natten's na2d_av on the released weights, within 1e-3"
+    - "full state-dict key parity modulo the documented aux_head drop, exercised on all four released checkpoints rather than a toy dict"
+  does_not_establish:
+    - "sub-1e-3 numerical drift, training-time behaviour, deploy/reparam folding, or downstream COCO/ADE20K results"
+  not_measured:
+    - "throughput, latency, memory, TorchScript export (excluded by the PR), features_only pyramid values"
+  caveat: "Paper top-1 was trained WITH natten and deep supervision, the XT row (82.2) is assumed rather than read from the paper table, and a shard under ~6.5k images cannot statistically resolve the 0.3pp band"
+  next: "If any key mismatch or logit divergence appears, fix the port before upstreaming; otherwise run the full 50k ImageNet val pass for the accuracy row"
