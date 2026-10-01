@@ -57,7 +57,7 @@ FEAT_INTER_FILTERS = [
     'tiny_vit', 'vovnet', 'tresnet', 'rexnet', 'resnetv2', 'repghost', 'repvit', 'pvt_v2', 'nextvit', 'nest',
     'mambaout', 'inception_next', 'inception_v4', 'hgnet', 'gcvit', 'focalnet', 'efficientformer_v2', 'edgenext',
     'davit', 'rdnet', 'convnext', 'pit', 'starnet', 'shvit', 'fasternet', 'swiftformer', 'ghostnet', 'naflexvit',
-    'csatv2', 'cpubone', 'lcnetv2', 'lowformer'
+    'csatv2', 'cpubone', 'lcnetv2', 'lowformer', 'overlock'
 ]
 
 # transformer / hybrid models don't support full set of spatial / feature APIs and/or have spatial output.
@@ -88,6 +88,10 @@ EXCLUDE_JIT_FILTERS = [
     # gemma4_vit shares NaFlex's ``Union[Tensor, Dict[str, Tensor]]`` forward signature,
     # which TorchScript cannot narrow (``Unknown type name 'dict'``).
     'gemma4_vit*',
+    # overlock's DilatedReparamBlock addresses its dilated conv/bn branches via dynamically
+    # formatted attribute names to match the released checkpoint keys; TorchScript supports
+    # neither dynamic __getattr__ nor the einops-free neighborhood aggregation's reshape flow.
+    'overlock*',
 ]
 
 TARGET_FWD_SIZE = MAX_FWD_SIZE = 384
@@ -1076,3 +1080,60 @@ def test_gemma4_forward_intermediates_dict_output():
     assert torch.equal(out['patch_valid'], valid)
     assert torch.allclose(out['image_features'], final)
     assert len(out['image_intermediates']) == len(inter)
+
+
+@pytest.mark.base
+@pytest.mark.timeout(timeout240)
+def test_overlock_forward_smoke():
+    """OverLoCK CPU smoke test (no weights): construct the smallest variant, run a forward pass
+    on a (2, 3, 224, 224) batch and check logits shape / finiteness. Proves the pure-PyTorch
+    (natten-free, iGEMM-free) port constructs and runs - NOT accuracy."""
+    model = create_model('overlock_xt', pretrained=False)
+    model.eval()
+    inputs = torch.randn(2, 3, 224, 224)
+    with torch.no_grad():
+        outputs = model(inputs)
+    assert outputs.shape == (2, 1000)
+    assert not torch.isnan(outputs).any(), 'Output included NaNs'
+    assert torch.isfinite(outputs).all(), 'Output included non-finite values'
+    with torch.no_grad():
+        features = model.forward_features(inputs)
+    assert features.shape == (2, model.num_features, 7, 7)
+
+
+@pytest.mark.features
+@pytest.mark.timeout(timeout240)
+def test_overlock_features_only_shapes():
+    """OverLoCK features_only backbone returns the 4 main-branch stage features with the expected
+    channels and reduction strides (the auxiliary context branch is not exposed)."""
+    model = create_model('overlock_xt', pretrained=False, features_only=True)
+    model.eval()
+    expected_channels = model.feature_info.channels()
+    expected_reduction = model.feature_info.reduction()
+    assert expected_channels == [56, 112, 256, 420]
+    assert expected_reduction == [4, 8, 16, 32]
+    with torch.no_grad():
+        outputs = model(torch.randn(2, 3, 224, 224))
+    assert len(outputs) == 4
+    for out, chs, red in zip(outputs, expected_channels, expected_reduction):
+        assert out.shape == (2, chs, 224 // red, 224 // red)
+        assert not torch.isnan(out).any()
+
+
+@pytest.mark.base
+@pytest.mark.timeout(timeout240)
+def test_overlock_checkpoint_filter_fn():
+    """checkpoint_filter_fn drops the training-only aux head keys and unwraps trainer containers,
+    so a reference-style state dict loads into the timm port without unexpected keys."""
+    from timm.models.overlock import checkpoint_filter_fn
+    model = create_model('overlock_xt', pretrained=False)
+    reference_sd = {
+        'state_dict': {
+            'patch_embed1.0.weight': torch.zeros(1),
+            'module.head.4.weight': torch.zeros(1),
+            'aux_head.0.weight': torch.zeros(1),
+        },
+    }
+    filtered = checkpoint_filter_fn(reference_sd, model)
+    assert 'aux_head.0.weight' not in filtered
+    assert 'patch_embed1.0.weight' in filtered

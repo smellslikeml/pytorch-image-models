@@ -53,6 +53,7 @@ from .nasnet import *
 from .nest import *
 from .nextvit import *
 from .nfnet import *
+from .overlock import *
 from .pit import *
 from .pnasnet import *
 from .pvt_v2 import *
