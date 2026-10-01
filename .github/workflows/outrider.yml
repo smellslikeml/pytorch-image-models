@@ -15,9 +15,10 @@ name: Outrider
 # both per run (that's how a two-tier refiner dispatches its promotions).
 
 on:
-  schedule:
-    # Daily at 14:00 UTC
-    - cron: '0 14 * * *'
+  # schedule:
+  #   # Daily at 14:00 UTC
+  #   - cron: '0 14 * * *'
+  # Disabled: this fork runs on targeted `remyxai outrider trigger` dispatches only.
   workflow_dispatch:
     inputs:
       pin-arxiv:
@@ -55,7 +56,7 @@ on:
       provider:
         description: 'anthropic | zai | moonshot (empty = this repo default).'
         required: false
-        default: ''
+        default: 'zai'
       model:
         description: 'Model name (empty = this repo default).'
         required: false
