@@ -1,0 +1,183 @@
+name: Outrider
+
+# Daily cron that uses remyxai/outrider to pick a paper from
+# engine.remyx.ai for this research interest and open a draft PR with an
+# agent-scaffolded integration.
+#
+# Secrets needed (set in Settings → Secrets and variables → Actions):
+#   REMYX_API_KEY       — engine.remyx.ai token
+#   ANTHROPIC_API_KEY   — Claude Code key (when provider=anthropic)
+#   ZAI_API_KEY         — Z.ai key (when provider=zai)
+#   MOONSHOT_API_KEY    — Moonshot AI key (when provider=moonshot)
+#   OPENAI_API_KEY      — OpenAI key (when provider=openai)
+#   OPENROUTER_API_KEY  — OpenRouter key (when provider=openrouter)
+#   BACKBOARD_API_KEY   — Backboard R-CLI key (when agent=backboard)
+#
+# One key per configuration: the provider's own key, or a native router's
+# (it resolves providers against its own catalogue with its own account).
+# Every other agent credential is derived by the action from the provider's
+# key — never set one as a repo secret, an empty one shadows the derived
+# value.
+#
+# Baked defaults (this repo's agent config): agent=claude
+# provider=anthropic model=(provider default) — a
+# workflow_dispatch can override all three per run (that's how a two-tier
+# refiner dispatches its promotions).
+
+on:
+  schedule:
+    # Daily at 14:00 UTC
+    - cron: '0 14 * * *'
+  workflow_dispatch:
+    inputs:
+      agent:
+        description: 'Which coding-agent CLI runs the implementation. A separate axis from provider, which picks the model. The action rejects an impossible pair up front and names the agent that does serve your provider.'
+        type: choice
+        required: false
+        default: 'claude'
+        options:
+          - backboard
+          - claude
+          - codex
+      provider:
+        description: 'Which model backend to route the agent at. The action picks the matching secret, endpoint and auth style from its own registry.'
+        type: choice
+        required: false
+        default: 'anthropic'
+        options:
+          - anthropic
+          - custom
+          - moonshot
+          - openai
+          - openrouter
+          - zai
+      model:
+        description: 'Model id your provider lists. Empty keeps this repo default while the provider is unchanged, and lets the new vendor pick its own when you switch providers.'
+        required: false
+        default: ''
+      base-url:
+        description: 'Endpoint override for a self-hosted or proxied backend (empty = the provider default the action resolves).'
+        required: false
+        default: ''
+      mode:
+        description: 'Action mode passthrough. smoke makes one live agent call and verifies the wiring.'
+        required: false
+        default: ''
+      pin-arxiv:
+        description: 'Optional arxiv_id to implement directly (bypass selection).'
+        required: false
+        default: ''
+      publish:
+        description: 'pr (default) opens a PR/Issue; branch produces a fork branch without opening one.'
+        required: false
+        default: ''
+      start-from-ref:
+        description: 'Warm-start the session on an existing draft branch.'
+        required: false
+        default: ''
+      lead-content:
+        description: 'Ground the session on this text instead of pool selection.'
+        required: false
+        default: ''
+      staged-synthesis:
+        description: 'true/false passthrough.'
+        required: false
+        default: ''
+      test-integration-policy:
+        description: 'strict | soft | off — test-integration gate (empty = action default).'
+        required: false
+        default: ''
+      fidelity-policy:
+        description: 'block | advisory | off — pre-PR fidelity gate (empty = action default).'
+        required: false
+        default: ''
+
+concurrency:
+  # Keyed by what THIS dispatch works on, not a flat "outrider". A static group
+  # with cancel-in-progress:false permits exactly one *pending* run, so firing
+  # several dispatches at one repo silently cancels all but the last queued one
+  # — no error, and the cancellations read as flakes. Keying by target lets
+  # distinct papers/branches run in parallel (they touch different branches)
+  # while a true duplicate of the same target still queues behind its
+  # predecessor. Unpinned runs fall back to run_id: never cancel a dispatch we
+  # can't prove is a duplicate. (Index syntax, not dot — a workflow-level
+  # expression error invalidates the whole workflow, and hyphenated property
+  # names are only *documented* as safe when indexed.)
+  group: outrider-${{ inputs['pin-arxiv'] || inputs['start-from-ref'] || github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  recommend:
+    runs-on: ubuntu-latest
+    # Derived from agent-timeout below (+ push headroom); see JOB_TIMEOUT_MIN.
+    timeout-minutes: 90
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+    env:
+      REMYX_API_KEY: ${{ secrets.REMYX_API_KEY }}
+    steps:
+      # Mint a remyx[bot] token from Remyx so the PR / Issue is authored by
+      # the Remyx GitHub App (not github-actions[bot]). The App private key
+      # stays on Remyx's side; this uses the REMYX_API_KEY already in secrets.
+      # If it can't be minted (e.g. App not installed), the token is empty and
+      # the action falls back to the workflow's built-in GITHUB_TOKEN.
+      - name: Mint Remyx bot token
+        id: remyx-bot
+        shell: bash
+        run: |
+          token="$(curl -sf -X POST             -H "Authorization: Bearer ${{ secrets.REMYX_API_KEY }}"             -H "Content-Type: application/json"             -d "{"repo": "${{ github.repository }}"}"             "https://engine.remyx.ai/api/v1.0/github/installation-token"             | python3 -c "import sys, json; print(json.load(sys.stdin).get('token', ''))")" || token=""
+          echo "::add-mask::$token"
+          echo "token=$token" >> "$GITHUB_OUTPUT"
+      - uses: remyxai/outrider@v1
+        env:
+          # Every credential the action might read, generated from its
+          # published matrix. It reads only the ones its agent / provider
+          # select; the rest are empty and ignored, and a missing one fails
+          # clean with an error naming exactly the secret it needed.
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          MOONSHOT_API_KEY: ${{ secrets.MOONSHOT_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
+          BACKBOARD_API_KEY: ${{ secrets.BACKBOARD_API_KEY }}
+        with:
+          # The agent is tied to this research interest. A second interest on
+          # the same repo is installed as its own workflow file rather than
+          # sharing this one.
+          interest-id: '5b891bbd-f312-4a48-8fc8-a63c5cf5ccc5'
+          # remyx[bot] token (empty → action falls back to GITHUB_TOKEN).
+          github-token: ${{ steps.remyx-bot.outputs.token }}
+          # Disable the per-repo rate-limit window so manual and scheduled
+          # runs always evaluate the latest recommendation. Per-paper dedup
+          # (open PR / Issue for the same arxiv_id) still prevents duplicates.
+          rate-limit-days: '0'
+          # The two backend axes, forwarded so one install can switch either
+          # per dispatch. The action resolves the credential, endpoint and
+          # auth-header style for the pair.
+          agent: ${{ inputs.agent }}
+          provider: ${{ inputs.provider }}
+          # The baked model applies only while the run is on the baked
+          # provider. Carrying it across a provider switch is the most common
+          # misconfiguration there is — a dispatch that changed `provider`
+          # alone used to send the previous vendor's model id and fail on
+          # "that model may not exist".
+          model: ${{ inputs.model || (inputs.provider == 'anthropic' && '' || '') }}
+          # Empty = the endpoint the action resolves for the provider. Set it
+          # for a self-hosted model, a proxy, or an on-prem gateway.
+          model-base-url: ${{ inputs['base-url'] }}
+          # Per-phase wall-clock budget. Neither Codex nor R-CLI has a
+          # round cap, so this is their only spend bound. Baked rather than
+          # dispatched: the input budget is full (see MAIN_WORKFLOW_INPUTS).
+          # Must stay under the job's timeout-minutes or GitHub cancels the
+          # run before the branch is pushed.
+          agent-timeout: '3600'
+          mode: ${{ inputs.mode }}
+          pin-arxiv: ${{ inputs.pin-arxiv }}
+          publish: ${{ inputs.publish }}
+          start-from-ref: ${{ inputs.start-from-ref }}
+          lead-content: ${{ inputs.lead-content }}
+          staged-synthesis: ${{ inputs.staged-synthesis }}
+          test-integration-policy: ${{ inputs.test-integration-policy }}
+          fidelity-policy: ${{ inputs.fidelity-policy }}
