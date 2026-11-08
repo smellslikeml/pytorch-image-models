@@ -48,6 +48,7 @@ from .lowformer import *
 from .maxxvit import *
 from .mambaout import *
 from .metaformer import *
+from .microvit import *
 from .mlp_mixer import *
 from .mobilenetv3 import *
 from .mobilenetv5 import *
