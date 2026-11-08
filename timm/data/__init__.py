@@ -1,6 +1,7 @@
 from .auto_augment import RandAugment, AutoAugment, rand_augment_ops, auto_augment_policy,\
     rand_augment_transform, auto_augment_transform
 from .config import resolve_data_config, resolve_model_data_config
+from .model_config import resolve_input_data_config
 from .constants import *
 from .dataset import ImageDataset, IterableImageDataset, AugMixDataset
 from .dataset_factory import create_dataset
@@ -21,6 +22,7 @@ from .naflex_transforms import (
     patchify_image,
 )
 from .scheduled_sampler import ScheduledBatchSampler, ScheduledTransformDataset
+from .target_transforms import MultiLabelTarget
 from .readers import create_reader
 from .readers import get_img_extensions, is_img_extension, set_img_extensions, add_img_extensions, del_img_extensions
 from .real_labels import RealLabelsImagenet

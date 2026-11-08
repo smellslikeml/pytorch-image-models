@@ -14,6 +14,7 @@ from typing import Callable, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.utils.data
+from torch.utils.data import default_collate
 import numpy as np
 
 from .constants import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
@@ -28,35 +29,35 @@ _logger = logging.getLogger(__name__)
 
 
 def fast_collate(batch):
-    """ A fast collation function optimized for uint8 images (np array or torch) and int64 targets (labels)"""
+    """Collate uint8 images with scalar class indices or dense target tensors."""
     assert isinstance(batch[0], tuple)
     batch_size = len(batch)
+    targets = default_collate([b[1] for b in batch])
+    if targets.ndim == 1:
+        targets = targets.long()  # scalar class indices, whatever the source dtype (int, bool, float)
     if isinstance(batch[0][0], tuple):
         # This branch 'deinterleaves' and flattens tuples of input tensors into one tensor ordered by position
         # such that all tuple of position n will end up in a torch.split(tensor, batch_size) in nth position
-        is_np = isinstance(batch[0][0], np.ndarray)
+        is_np = isinstance(batch[0][0][0], np.ndarray)
         inner_tuple_size = len(batch[0][0])
         flattened_batch_size = batch_size * inner_tuple_size
-        targets = torch.zeros(flattened_batch_size, dtype=torch.int64)
+        targets = targets.repeat((inner_tuple_size,) + (1,) * (targets.ndim - 1))
         tensor = torch.zeros((flattened_batch_size, *batch[0][0][0].shape), dtype=torch.uint8)
         for i in range(batch_size):
             assert len(batch[i][0]) == inner_tuple_size  # all input tensor tuples must be same length
             for j in range(inner_tuple_size):
-                targets[i + j * batch_size] = batch[i][1]
                 if is_np:
                     tensor[i + j * batch_size] += torch.from_numpy(batch[i][0][j])
                 else:
                     tensor[i + j * batch_size] += batch[i][0][j]
         return tensor, targets
     elif isinstance(batch[0][0], np.ndarray):
-        targets = torch.tensor([b[1] for b in batch], dtype=torch.int64)
         assert len(targets) == batch_size
         tensor = torch.zeros((batch_size, *batch[0][0].shape), dtype=torch.uint8)
         for i in range(batch_size):
             tensor[i] += torch.from_numpy(batch[i][0])
         return tensor, targets
     elif isinstance(batch[0][0], torch.Tensor):
-        targets = torch.tensor([b[1] for b in batch], dtype=torch.int64)
         assert len(targets) == batch_size
         tensor = torch.zeros((batch_size, *batch[0][0].shape), dtype=torch.uint8)
         for i in range(batch_size):
@@ -79,6 +80,11 @@ def adapt_to_chs(x, n):
 
 
 class PrefetchLoader:
+    """Prefetch batches to the device on a side stream and normalize them there.
+
+    The transfer of the next batch overlaps the consumer's work on the current one. Batches must
+    be consumed on the stream that is current when the iterator is advanced.
+    """
 
     def __init__(
             self,
@@ -120,20 +126,33 @@ class PrefetchLoader:
             self.random_erasing = None
         self.is_cuda = device.type == 'cuda' and torch.cuda.is_available()
         self.is_npu = device.type == 'npu' and torch.npu.is_available()
+        self.stream = None
 
     def __iter__(self):
         first = True
+
+        device_mod = None
         if self.is_cuda:
-            stream = torch.cuda.Stream(device=self.device)
-            stream_context = partial(torch.cuda.stream, stream=stream)
+            device_mod = torch.cuda
         elif self.is_npu:
-            stream = torch.npu.Stream(device=self.device)
-            stream_context = partial(torch.npu.stream, stream=stream)
+            device_mod = torch.npu
+
+        if device_mod is not None:
+            if self.stream is None:
+                # One stream for the lifetime of the loader. The caching allocator pools blocks per stream,
+                # so a new stream per epoch leaves every previous epoch's blocks cached but unusable.
+                self.stream = device_mod.Stream(device=self.device)
+            stream_context = partial(device_mod.stream, stream=self.stream)
+            consumer_stream = device_mod.current_stream(device=self.device)
         else:
-            stream = None
             stream_context = suppress
+            consumer_stream = None
 
         for next_input, next_target in self.loader:
+            if consumer_stream is not None:
+                # Blocks released by the consumer may be handed to the allocations below. Do not let the
+                # prefetch stream write into them until the consumer's queued work has finished.
+                self.stream.wait_stream(consumer_stream)
 
             with stream_context():
                 next_input = next_input.to(device=self.device, non_blocking=True)
@@ -147,16 +166,15 @@ class PrefetchLoader:
             else:
                 first = False
 
-            if stream is not None:
-                if self.is_cuda:
-                    torch.cuda.current_stream(device=self.device).wait_stream(stream)
-                elif self.is_npu:
-                    torch.npu.current_stream(device=self.device).wait_stream(stream)
+            if consumer_stream is not None:
+                consumer_stream = device_mod.current_stream(device=self.device)
+                consumer_stream.wait_stream(self.stream)
 
             input = next_input
             target = next_target
 
-        yield input, target
+        if not first:
+            yield input, target
 
     def __len__(self):
         return len(self.loader)
@@ -463,7 +481,7 @@ def create_loader(
             re_prob=prefetch_re_prob,
             re_mode=re_mode,
             re_count=re_count,
-            re_num_splits=re_num_splits
+            re_num_splits=re_num_splits,
         )
 
     return loader
@@ -479,12 +497,14 @@ class MultiEpochsDataLoader(torch.utils.data.DataLoader):
         else:
             self.batch_sampler = _RepeatSampler(self.batch_sampler)
         self._DataLoader__initialized = True
-        self.iterator = super().__iter__()
+        self.iterator = None  # created on first iter so a sampler set_epoch() before then is used
 
     def __len__(self):
         return len(self.sampler) if self.batch_sampler is None else len(self.batch_sampler.sampler)
 
     def __iter__(self):
+        if self.iterator is None:
+            self.iterator = super().__iter__()
         for i in range(len(self)):
             yield next(self.iterator)
 
@@ -500,5 +520,11 @@ class _RepeatSampler(object):
         self.sampler = sampler
 
     def __iter__(self):
+        # the next pass is started (prefetched) before the train loop calls set_epoch(), so advance the epoch here
+        sampler = getattr(self.sampler, 'sampler', self.sampler)  # unwrap batch sampler
+        epoch = getattr(sampler, 'epoch', None) if hasattr(sampler, 'set_epoch') else None
         while True:
+            if epoch is not None:
+                sampler.set_epoch(epoch)
+                epoch += 1
             yield from iter(self.sampler)

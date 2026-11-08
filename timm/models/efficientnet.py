@@ -6,25 +6,39 @@ An implementation of EfficienNet that covers variety of related models with effi
   - `EfficientNetV2: Smaller Models and Faster Training` - https://arxiv.org/abs/2104.00298
 
 * EfficientNet (B0-B8, L2 + Tensorflow pretrained AutoAug/RandAug/AdvProp/NoisyStudent weight ports)
-  - EfficientNet: Rethinking Model Scaling for CNNs - https://arxiv.org/abs/1905.11946
-  - CondConv: Conditionally Parameterized Convolutions for Efficient Inference - https://arxiv.org/abs/1904.04971
-  - Adversarial Examples Improve Image Recognition - https://arxiv.org/abs/1911.09665
-  - Self-training with Noisy Student improves ImageNet classification - https://arxiv.org/abs/1911.04252
+  - `EfficientNet: Rethinking Model Scaling for Convolutional Neural Networks` - https://arxiv.org/abs/1905.11946
+  - `CondConv: Conditionally Parameterized Convolutions for Efficient Inference` - https://arxiv.org/abs/1904.04971
+  - `Adversarial Examples Improve Image Recognition` - https://arxiv.org/abs/1911.09665
+  - `Self-training with Noisy Student improves ImageNet classification` - https://arxiv.org/abs/1911.04252
+  - `Knapsack Pruning with Inner Distillation` - https://arxiv.org/abs/2002.08258
+  - `Evolving Normalization-Activation Layers` - https://arxiv.org/abs/2004.02967
+
+* EfficientNet-X
+  - `Searching for Fast Model Families on Datacenter Accelerators` - https://arxiv.org/abs/2102.05610
 
 * MixNet (Small, Medium, and Large)
-  - MixConv: Mixed Depthwise Convolutional Kernels - https://arxiv.org/abs/1907.09595
+  - `MixConv: Mixed Depthwise Convolutional Kernels` - https://arxiv.org/abs/1907.09595
 
 * MNasNet B1, A1 (SE), Small
-  - MnasNet: Platform-Aware Neural Architecture Search for Mobile - https://arxiv.org/abs/1807.11626
+  - `MnasNet: Platform-Aware Neural Architecture Search for Mobile` - https://arxiv.org/abs/1807.11626
+
+* MobileNet-V1
+  - `MobileNets: Efficient Convolutional Neural Networks for Mobile Vision Applications` - https://arxiv.org/abs/1704.04861
+
+* MobileNet-V2
+  - `MobileNetV2: Inverted Residuals and Linear Bottlenecks` - https://arxiv.org/abs/1801.04381
+
+* MobileNet-EdgeTPU-V2
+  - `Searching for Efficient Neural Architectures for On-Device ML on Edge TPUs` - https://arxiv.org/abs/2204.14007
 
 * FBNet-C
-  - FBNet: Hardware-Aware Efficient ConvNet Design via Differentiable NAS - https://arxiv.org/abs/1812.03443
+  - `FBNet: Hardware-Aware Efficient ConvNet Design via Differentiable Neural Architecture Search` - https://arxiv.org/abs/1812.03443
 
 * Single-Path NAS Pixel1
-  - Single-Path NAS: Designing Hardware-Efficient ConvNets - https://arxiv.org/abs/1904.02877
+  - `Single-Path NAS: Designing Hardware-Efficient ConvNets in less than 4 Hours` - https://arxiv.org/abs/1904.02877
 
 * TinyNet
-    - Model Rubik's Cube: Twisting Resolution, Depth and Width for TinyNets - https://arxiv.org/abs/2010.14819
+    - `Model Rubik's Cube: Twisting Resolution, Depth and Width for TinyNets` - https://arxiv.org/abs/2010.14819
     - Definitions & weights borrowed from https://github.com/huawei-noah/CV-Backbones/tree/master/tinynet_pytorch
 
 * And likely more...
@@ -159,11 +173,11 @@ class EfficientNet(nn.Module):
         if num_features > 0:
             self.conv_head = create_conv2d(head_chs, num_features, 1, padding=pad_type, **dd)
             self.bn2 = norm_act_layer(num_features, inplace=True, **dd)
-            self.num_features = self.head_hidden_size = num_features
+            self.num_features = num_features
         else:
             self.conv_head = nn.Identity()
             self.bn2 = nn.Identity()
-            self.num_features = self.head_hidden_size = head_chs
+            self.num_features = head_chs
 
         self.global_pool, self.classifier = create_classifier(
             self.num_features,
@@ -171,6 +185,7 @@ class EfficientNet(nn.Module):
             pool_type=global_pool,
             **dd,
         )
+        self.head_hidden_size = self.num_features * self.global_pool.feat_mult()
 
         efficientnet_init_weights(self)
 
@@ -214,17 +229,20 @@ class EfficientNet(nn.Module):
         """Get the classifier module."""
         return self.classifier
 
-    def reset_classifier(self, num_classes: int, global_pool: str = 'avg') -> None:
+    def reset_classifier(self, num_classes: int, global_pool: Optional[str] = None) -> None:
         """Reset the classifier head.
 
         Args:
             num_classes: Number of classes for new classifier.
-            global_pool: Global pooling type.
+            global_pool: Global pooling type, current pooling is kept if None.
         """
         dd = get_device_dtype(self)
         self.num_classes = num_classes
+        if global_pool is None:
+            global_pool = self.global_pool.pool_type
         self.global_pool, self.classifier = create_classifier(
             self.num_features, self.num_classes, pool_type=global_pool, **dd)
+        self.head_hidden_size = self.num_features * self.global_pool.feat_mult()
         self.global_pool.train(self.training)
         self.classifier.train(self.training)
 
@@ -308,14 +326,25 @@ class EfficientNet(nn.Module):
         """
         if extra_blocks:
             take_indices, max_index = feature_take_indices(len(self.blocks) + 1, indices)
+            # idx 0 is the stem
+            num_chs = (
+                self.blocks[max_index - 1][-1].feature_info('bottleneck')['num_chs'] if max_index
+                else self.conv_stem.out_channels
+            )
         else:
             take_indices, max_index = feature_take_indices(len(self.stage_ends), indices)
+            num_chs = self.feature_info[max_index]['num_chs']
             max_index = self.stage_ends[max_index]
+        # conv_head / bn2 follow the last stage and never feed the features (norm or not), removed if blocks are
+        # truncated, or w/ the head or norm
+        prune_end = prune_norm or prune_head or max_index < len(self.blocks)
         self.blocks = self.blocks[:max_index]  # truncate blocks w/ stem as idx 0
-        if prune_norm or max_index < len(self.blocks):
+        if prune_end:
             self.conv_head = nn.Identity()
             self.bn2 = nn.Identity()
-        if prune_head:
+            # features now end at the last kept tap, the head is sized for the final features so it goes too
+            self.num_features = self.head_hidden_size = num_chs
+        if prune_head or prune_end:
             self.reset_classifier(0, '')
         return take_indices
 

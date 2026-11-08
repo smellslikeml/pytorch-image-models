@@ -12,6 +12,39 @@ if torch_backend is not None:
 torch_device = os.environ.get('TORCH_DEVICE', 'cpu')
 
 
+@pytest.mark.parametrize('api', ['functional', 'module', 'factory'])
+@pytest.mark.parametrize('input_size,kernel_size,stride,dilation,padding', [
+    ((5, 7), (3, 3), (2, 2), (1, 1), (1, 1, 1, 1)),
+    ((5, 7), (3, 3), (2, 2), (2, 2), (2, 2, 2, 2)),
+    ((6, 7), (2, 3), (2, 3), (3, 2), (2, 2, 1, 1)),
+    ((2, 3), (3, 2), (2, 2), (2, 3), (1, 2, 1, 2)),
+])
+def test_max_pool2d_same_dilation(api, input_size, kernel_size, stride, dilation, padding):
+    """Dilated SAME pooling preserves output size and matches explicitly padded pooling."""
+    from timm.layers.pool2d_same import MaxPool2dSame, create_pool2d, max_pool2d_same
+
+    # Negative inputs also verify that padded values cannot become maxima at the borders.
+    height, width = input_size
+    x = -torch.arange(1, height * width + 1, device=torch_device, dtype=torch.float32).reshape(1, 1, height, width)
+    expected = torch.nn.functional.max_pool2d(
+        torch.nn.functional.pad(x, padding, value=-float('inf')),
+        kernel_size,
+        stride,
+        dilation=dilation,
+    )
+
+    if api == 'functional':
+        actual = max_pool2d_same(x, kernel_size, stride, dilation=dilation)
+    elif api == 'module':
+        actual = MaxPool2dSame(kernel_size, stride, dilation=dilation)(x)
+    else:
+        actual = create_pool2d('max', kernel_size, stride, padding='same', dilation=dilation)(x)
+
+    expected_shape = ((height + stride[0] - 1) // stride[0], (width + stride[1] - 1) // stride[1])
+    assert actual.shape[-2:] == expected_shape
+    torch.testing.assert_close(actual, expected)
+
+
 # Adaptive Avg/Max Pooling Tests
 
 class TestAdaptiveAvgMaxPool:
@@ -144,6 +177,37 @@ class TestAttentionPool:
             x = torch.randn(2, 64, size, size, device=torch_device)
             out = pool(x)
             assert out.shape == (2, 64)
+
+    @pytest.mark.parametrize('feat_size,input_size', [
+        ((3, 5), (3, 5)),
+        ((3, 5), (5, 7)),
+        ((2, 8), (4, 4)),
+    ])
+    @pytest.mark.parametrize('qkv_separate', [False, True])
+    def test_attention_pool2d_rectangular_source(self, feat_size, input_size, qkv_separate):
+        from timm.layers import AttentionPool2d
+        pool = AttentionPool2d(
+            in_features=64, feat_size=feat_size, num_heads=4, qkv_separate=qkv_separate,
+        ).to(torch_device)
+        x = torch.randn(2, 64, *input_size, device=torch_device)
+
+        # Interpolate the spatial grid explicitly, leaving the prefix position unchanged.
+        spatial_pos = pool.pos_embed[1:].T.reshape(1, 64, *feat_size)
+        spatial_pos = torch.nn.functional.interpolate(
+            spatial_pos, size=input_size, mode='bicubic', antialias=True,
+        ).flatten(2).transpose(1, 2)
+        pos_embed = torch.cat([pool.pos_embed[:1].unsqueeze(0), spatial_pos], dim=1)
+        tokens = x.flatten(2).transpose(1, 2)
+        tokens = torch.cat([tokens.mean(1, keepdim=True), tokens], dim=1) + pos_embed
+        if qkv_separate:
+            qkv = pool.q(tokens), pool.k(tokens), pool.v(tokens)
+        else:
+            qkv = pool.qkv(tokens).chunk(3, dim=-1)
+        q, k, v = [t.reshape(2, -1, 4, 16).transpose(1, 2) for t in qkv]
+        attn = ((q * pool.scale) @ k.transpose(-2, -1)).softmax(dim=-1)
+        expected = pool.proj((attn @ v).transpose(1, 2).reshape(2, -1, 64))[:, 0]
+
+        torch.testing.assert_close(pool(x), expected)
 
     def test_rot_attention_pool2d_basic(self):
         from timm.layers import RotAttentionPool2d

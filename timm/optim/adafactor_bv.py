@@ -16,7 +16,7 @@ import torch
 from torch import Tensor
 from torch.optim import Optimizer
 
-from ._helpers import _get_value, _init_scalar, _validate_scalar
+from ._helpers import _get_scalar_dtype, _get_value, _init_scalar, _max_lr_snapshot, _validate_scalar
 from ._types import ParamsT
 
 
@@ -24,7 +24,7 @@ def _factored_dims(
         shape: Tuple[int, ...],
         factored: bool,
         min_dim_size_to_factor: int
-) -> Optional[tuple[int, int]]:
+) -> Optional[Tuple[int, int]]:
     """Whether to use a factored second moment estimator.
 
     This function returns a tuple with the two largest axes to reduce over.
@@ -69,8 +69,6 @@ class AdafactorBigVision(Optimizer):
             unscaled_wd: bool = False,
             caution: bool = False,
             corrected_weight_decay: bool = False,
-            *,
-            foreach: Optional[bool] = False,
     ):
         if isinstance(momentum_dtype, str):
             if momentum_dtype == 'float16':
@@ -98,26 +96,27 @@ class AdafactorBigVision(Optimizer):
             unscaled_wd=unscaled_wd,
             caution=caution,
             corrected_weight_decay=corrected_weight_decay,
-            foreach=foreach,
+            max_lr_snapshot=_max_lr_snapshot(lr, corrected_weight_decay),
         )
         super().__init__(params, defaults)
 
     def __setstate__(self, state):
         super().__setstate__(state)
+        self.defaults.setdefault('max_lr_snapshot', _max_lr_snapshot(self.defaults['lr']))  # pickled pre-snapshot
         for group in self.param_groups:
             group.setdefault('caution', False)
             group.setdefault('corrected_weight_decay', False)
-            group.setdefault('foreach', None)
+            group.setdefault('max_lr_snapshot', self.defaults['max_lr_snapshot'])
             for p in group['params']:
                 p_state = self.state.get(p, {})
                 if len(p_state) != 0 and 'step' in p_state:
-                    p_state['step'] = _init_scalar(p_state['step'], device='cpu', dtype=torch.float64)
+                    p_state['step'] = _init_scalar(p_state['step'], device='cpu', dtype=_get_scalar_dtype())
 
                 if 'exp_avg' in p_state and torch.is_tensor(p_state['exp_avg']):
                     # FIXME this is a bit of a hack, optimizer.load_state_dict appears to upcast
                     # the momentum to float32 (it's half precision in the state_dict), need to
                     # look into this further. Better to override _process_value_according_to_param_policy?
-                    p_state['exp_avg'] = p_state['exp_avg'].to(dtype=self.defaults['momentum_dtype'])
+                    p_state['exp_avg'] = p_state['exp_avg'].to(dtype=group['momentum_dtype'])
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -148,13 +147,14 @@ class AdafactorBigVision(Optimizer):
                 state = self.state[p]
 
                 if len(state) == 0:
-                    state['step'] = _init_scalar(device='cpu', dtype=torch.float64)
+                    # default scalar dtype (float32), torch.compile < 2.14 drops in-place updates of float64 CPU scalars
+                    state['step'] = _init_scalar(device='cpu', dtype=_get_scalar_dtype())
 
                     shape = p.grad.shape
                     factored_dims = _factored_dims(
                         shape,
                         factored=True,
-                        min_dim_size_to_factor=self.defaults['min_dim_size_to_factor']
+                        min_dim_size_to_factor=group['min_dim_size_to_factor']
                     )
 
                     if factored_dims is not None:
@@ -168,8 +168,8 @@ class AdafactorBigVision(Optimizer):
                     else:
                         state['exp_avg_sq'] = torch.zeros_like(p.grad, memory_format=torch.preserve_format)
 
-                    if self.defaults['momentum'] is not None:
-                        state['exp_avg'] = torch.zeros_like(p.grad, dtype=self.defaults['momentum_dtype'])
+                    if group['momentum'] is not None:
+                        state['exp_avg'] = torch.zeros_like(p.grad, dtype=group['momentum_dtype'])
 
                 state_steps.append(state['step'])
                 exp_avg_sq_rs.append(state.get('exp_avg_sq_r', None))
@@ -177,12 +177,7 @@ class AdafactorBigVision(Optimizer):
                 exp_avg_sqs.append(state.get('exp_avg_sq', None))
                 exp_avgs.append(state.get('exp_avg', None))
 
-            if group['foreach']:
-                func = _multi_tensor_adafactor
-            else:
-                func = _single_tensor_adafactor
-
-            func(
+            _single_tensor_adafactor(
                 params=params_with_grad,
                 grads=grads,
                 exp_avg_sq_rs=exp_avg_sq_rs,
@@ -191,6 +186,7 @@ class AdafactorBigVision(Optimizer):
                 exp_avgs=exp_avgs,
                 state_steps=state_steps,
                 beta2_decay=group['decay_rate'],
+                beta2_decay_offset=group['decay_offset'],
                 beta2_cap=group['beta2_cap'],
                 min_dim_size_to_factor=group['min_dim_size_to_factor'],
                 eps=group['eps'],
@@ -201,7 +197,7 @@ class AdafactorBigVision(Optimizer):
                 clipping_threshold=group['clipping_threshold'],
                 unscaled_wd=group['unscaled_wd'],
                 caution=group['caution'],
-                max_lr=self.defaults['lr'] if group['corrected_weight_decay'] else None,
+                max_lr=group['max_lr_snapshot'] if group['corrected_weight_decay'] else None,
             )
 
         return loss
@@ -217,6 +213,7 @@ def _single_tensor_adafactor(
         state_steps: List[Tensor],
         *,
         beta2_decay: float,
+        beta2_decay_offset: int,
         beta2_cap: float,
         min_dim_size_to_factor: int,
         eps: float,
@@ -236,21 +233,23 @@ def _single_tensor_adafactor(
         exp_avg_sq = exp_avg_sqs[i]
         exp_avg = exp_avgs[i]
         step_t = state_steps[i]
-        if eps is None:
-            # default eps for avoiding div by zero, diff from float type eps
-            eps = 1e-7 if grad.dtype == torch.float16 else 1e-30
+        # default eps for avoiding div by zero, diff from float type eps, resolved per param (dtype may differ)
+        param_eps = eps if eps is not None else (1e-7 if grad.dtype == torch.float16 else 1e-30)
 
         # Update step
         step_t.add_(1)
         step = _get_value(step_t)
+        # beta2 decay schedule is offset by decay_offset steps (as per big_vision / optax), clamped to step 1
         if torch.is_tensor(step):
+            decay_step = (step - beta2_decay_offset).clamp(min=1) if beta2_decay_offset else step
             beta2_cap_t = torch.tensor(beta2_cap, dtype=step.dtype, device=step.device)
-            beta2_t = torch.minimum(beta2_cap_t, 1.0 - torch.pow(step, -beta2_decay))
+            beta2_t = torch.minimum(beta2_cap_t, 1.0 - torch.pow(decay_step, -beta2_decay))
         else:
-            beta2_t = min(beta2_cap, 1.0 - step ** (-beta2_decay))
+            decay_step = max(step - beta2_decay_offset, 1)
+            beta2_t = min(beta2_cap, 1.0 - decay_step ** (-beta2_decay))
         one_minus_beta2_t = 1 - beta2_t
 
-        grad_sqr = torch.square(grad) + eps
+        grad_sqr = torch.square(grad) + param_eps
         # NOTE application of eps (epsilon1) mirrors the optax/big vision/t5x approach
         if exp_avg_sq is None:
             # factorized second moment
@@ -272,10 +271,10 @@ def _single_tensor_adafactor(
             exp_avg_sq.lerp_(grad_sqr, one_minus_beta2_t)
             update = grad * exp_avg_sq.rsqrt()
 
-        # Clip by RMS value
+        # Clip by RMS value, update / max(1, rms(update) / clipping_threshold) as in big_vision / optax
         if clipping_threshold is not None:
-            denom = (update.norm(2) / ((update.numel() ** 0.5) / clipping_threshold)).clamp_(max=1.0)
-            update.div_(denom)
+            update_rms = update.norm(2) / (update.numel() ** 0.5)
+            update.div_((update_rms / clipping_threshold).clamp_(min=1.0))
 
         # Apply momentum (in different dtype)
         if momentum is not None and exp_avg is not None:
@@ -314,29 +313,3 @@ def _single_tensor_adafactor(
 
         # Update parameters
         param.add_(update, alpha=-1.0)
-
-
-def _multi_tensor_adafactor(
-        params: List[Tensor],
-        grads: List[Tensor],
-        exp_avg_sq_rs: List[Optional[Tensor]],
-        exp_avg_sq_cs: List[Optional[Tensor]],
-        exp_avg_sqs: List[Optional[Tensor]],
-        exp_avgs: List[Optional[Tensor]],
-        state_steps: List[Tensor],
-        *,
-        beta2_decay: float,
-        beta2_cap: float,
-        min_dim_size_to_factor: int,
-        eps: float,
-        lr: float,
-        weight_decay: float,
-        momentum: Optional[float],
-        momentum_dtype: Union[str, torch.dtype],
-        clipping_threshold: Optional[float],
-        unscaled_wd: bool,
-        caution: bool,
-        max_lr: Optional[float],
-):
-    # FIXME TODO
-    assert False, 'multi-tensor fn (foreach=True) not implemented yet'

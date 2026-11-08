@@ -30,16 +30,19 @@ class TrainingTask(nn.Module):
         dtype: Dtype for task tensors/buffers (defaults to torch default)
         verbose: Enable info logging
 
-    Example:
-        >>> task = SomeTask(model, criterion, device=torch.device('cuda'))
-        >>>
-        >>> # Prepare for distributed training (if needed)
-        >>> if distributed:
-        >>>     task.prepare_distributed(device_ids=[local_rank])
-        >>>
-        >>> # Training loop
-        >>> result = task(input, target)
-        >>> result['loss'].backward()
+    Examples:
+
+        ```python
+        task = SomeTask(model, criterion, device=torch.device('cuda'))
+
+        # prepare for distributed training (if needed)
+        if distributed:
+            task.prepare_distributed(device_ids=[local_rank])
+
+        # training loop
+        result = task(input, target)
+        result['loss'].backward()
+        ```
     """
 
     def __init__(
@@ -53,12 +56,16 @@ class TrainingTask(nn.Module):
         self.dtype = dtype if dtype is not None else torch.get_default_dtype()
         self.verbose = verbose
 
-    def to(self, *args, **kwargs):
-        """Move task to device/dtype, keeping self.device and self.dtype in sync."""
-        dummy = torch.empty(0).to(*args, **kwargs)
+    def _apply(self, fn, *args, **kwargs):
+        """Keep self.device and self.dtype in sync with any module conversion.
+
+        Covers .to(), .half(), .cuda() etc. and conversions applied via a parent module.
+        """
+        dummy = fn(torch.empty(0, device=self.device, dtype=self.dtype))
+        result = super()._apply(fn, *args, **kwargs)  # pass through, no `recurse` arg in older PyTorch
         self.device = dummy.device
         self.dtype = dummy.dtype
-        return super().to(*args, **kwargs)
+        return result
 
     def prepare_distributed(
             self,
@@ -79,10 +86,13 @@ class TrainingTask(nn.Module):
         Returns:
             self (for method chaining)
 
-        Example:
-            >>> task = LogitDistillationTask(student, teacher, criterion)
-            >>> task.compile()
-            >>> task.prepare_distributed(device_ids=[args.local_rank])
+        Examples:
+
+            ```python
+            task = LogitDistillationTask(student, teacher, criterion)
+            task.compile()
+            task.prepare_distributed(device_ids=[args.local_rank])
+            ```
         """
         # Default implementation - subclasses override if they need DDP
         return self
@@ -229,6 +239,15 @@ class TrainingTask(nn.Module):
         if module is not None and module is not self and hasattr(module, 'no_sync'):
             return module.no_sync()
         return nullcontext()
+
+    def create_evaluator(self, **kwargs):
+        """Create a fresh evaluator for the eval model returned by get_eval_model().
+
+        The default assumes single-label logits with class index targets. Tasks
+        with other target formats override this to return a matching evaluator.
+        """
+        from .evaluator import ClassificationEvaluator
+        return ClassificationEvaluator(device=self.device, **kwargs)
 
     def forward(
             self,

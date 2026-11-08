@@ -52,7 +52,7 @@ class RotAttentionPool2d(nn.Module):
     ):
         dd = {'device': device, 'dtype': dtype}
         super().__init__()
-        assert pool_type in ('', 'token')
+        assert pool_type in ('', 'token'), 'Only token pooling (or none) is supported.'
         self.embed_dim = embed_dim = embed_dim or in_features
         self.in_features = in_features
         if out_features is None:
@@ -90,13 +90,14 @@ class RotAttentionPool2d(nn.Module):
         self.drop = nn.Dropout(drop_rate)
         self.proj = nn.Linear(embed_dim, self.out_features, **dd) if out_features != 0 else nn.Identity()
 
+        self.rotate_half = rope_type == 'mrope'
         self.pos_embed = create_rope_embed(
             rope_type=rope_type,
             dim=embed_dim,
             num_heads=num_heads,
             in_pixels=False,
             ref_feat_shape=ref_feat_size,
-            rotate_half=False,
+            rotate_half=self.rotate_half,
             **dd,
         )
 
@@ -118,13 +119,15 @@ class RotAttentionPool2d(nn.Module):
             self,
             num_classes: Optional[int] = None,
             pool_type: Optional[str] = None,
+            reset_other: bool = False,
             device=None,
             dtype=None,
     ):
         # NOTE: this module is being used as a head, so need compatible reset()
+        # reset_other is a no-op, the attention is the pooling and there are no other layers besides the classifier
         dd = get_device_dtype(self, device=device, dtype=dtype)
         if pool_type is not None:
-            assert pool_type in ('', 'token')
+            assert pool_type in ('', 'token'), 'Only token pooling (or none) is supported.'
             self.pool_type = pool_type
         if num_classes is not None:
             self.proj = nn.Linear(self.embed_dim, num_classes, **dd) if num_classes > 0 else nn.Identity()
@@ -159,8 +162,12 @@ class RotAttentionPool2d(nn.Module):
         if isinstance(rope, tuple):
             # RotaryEmbedding returns (sin, cos) tuple - concatenate for apply_rot_embed_cat
             rope = torch.cat(rope, dim=-1)
-        q = torch.cat([q[:, :, :1, :], apply_rot_embed_cat(q[:, :, 1:, :], rope)], dim=2).type_as(v)
-        k = torch.cat([k[:, :, :1, :], apply_rot_embed_cat(k[:, :, 1:, :], rope)], dim=2).type_as(v)
+        q = torch.cat([
+            q[:, :, :1, :], apply_rot_embed_cat(q[:, :, 1:, :], rope, half=self.rotate_half),
+        ], dim=2).type_as(v)
+        k = torch.cat([
+            k[:, :, :1, :], apply_rot_embed_cat(k[:, :, 1:, :], rope, half=self.rotate_half),
+        ], dim=2).type_as(v)
 
         if self.fused_attn:
             x = nn.functional.scaled_dot_product_attention(q, k, v)
@@ -186,7 +193,7 @@ class AttentionPool2d(nn.Module):
     It was based on impl in CLIP by OpenAI
     https://github.com/openai/CLIP/blob/3b473b0e682c091a9e53623eebc1ca1657385717/clip/model.py
 
-    NOTE: This requires feature size upon construction and well prevent adaptive sizing of the network.
+    The positional embedding is initialized for feat_size and resampled for other input sizes.
 
     Setting out_features=0 disables the output projection (pre_logits mode).
     """
@@ -210,7 +217,7 @@ class AttentionPool2d(nn.Module):
     ):
         dd = {'device': device, 'dtype': dtype}
         super().__init__()
-        assert pool_type in ('', 'token')
+        assert pool_type in ('', 'token'), 'Only token pooling (or none) is supported.'
         self.embed_dim = embed_dim = embed_dim or in_features
         self.in_features = in_features
         if out_features is None:
@@ -271,13 +278,15 @@ class AttentionPool2d(nn.Module):
             self,
             num_classes: Optional[int] = None,
             pool_type: Optional[str] = None,
+            reset_other: bool = False,
             device=None,
             dtype=None,
     ):
         # NOTE: this module is being used as a head, so need compatible reset()
+        # reset_other is a no-op, the attention is the pooling and there are no other layers besides the classifier
         dd = get_device_dtype(self, device=device, dtype=dtype)
         if pool_type is not None:
-            assert pool_type in ('', 'token')
+            assert pool_type in ('', 'token'), 'Only token pooling (or none) is supported.'
             self.pool_type = pool_type
         if num_classes is not None:
             self.proj = nn.Linear(self.embed_dim, num_classes, **dd) if num_classes > 0 else nn.Identity()
@@ -300,7 +309,9 @@ class AttentionPool2d(nn.Module):
             x = torch.cat([x.mean(1, keepdim=True), x], dim=1)
         else:
             x = torch.cat([self.cls_token.expand(x.shape[0], -1, -1), x], dim=1)
-        pos_embed = resample_abs_pos_embed(self.pos_embed.unsqueeze(0), (H, W), num_prefix_tokens=1)
+        pos_embed = resample_abs_pos_embed(
+            self.pos_embed.unsqueeze(0), (H, W), old_size=self.feat_size, num_prefix_tokens=1,
+        )
         x = x + pos_embed
 
         if self.qkv is None:

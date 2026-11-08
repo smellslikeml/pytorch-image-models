@@ -4,6 +4,10 @@ Poolformer from MetaFormer is Actually What You Need for Vision https://arxiv.or
 IdentityFormer, RandFormer, PoolFormerV2, ConvFormer, and CAFormer
 from MetaFormer Baselines for Vision https://arxiv.org/abs/2210.13452
 
+Papers:
+    * `MetaFormer Is Actually What You Need for Vision` - https://arxiv.org/abs/2111.11418
+    * `MetaFormer Baselines for Vision` - https://arxiv.org/abs/2210.13452
+
 All implemented models support feature extraction and variable input resolution.
 
 Original implementation by Weihao Yu et al.,
@@ -26,6 +30,7 @@ Adapted from https://github.com/sail-sg/metaformer, original copyright below
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
 from collections import OrderedDict
 from functools import partial
 from typing import List, Optional, Tuple, Union, Type
@@ -573,6 +578,19 @@ class MetaFormer(nn.Module):
         if not isinstance(res_scale_init_values, (list, tuple)):
             res_scale_init_values = [res_scale_init_values] * self.num_stages
 
+        # remaining kwargs are passed through to every token mixer, each must be an arg of at least one of them
+        if kwargs:
+            mixer_args = set()
+            for tm in token_mixers:
+                mixer_args.update(
+                    n for n, p in inspect.signature(tm).parameters.items()
+                    if p.kind in (p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY)
+                )
+            unknown_kwargs = set(kwargs) - mixer_args
+            if unknown_kwargs:
+                raise TypeError(
+                    f'{type(self).__name__}.__init__() got unexpected keyword argument(s): {sorted(unknown_kwargs)}')
+
         self.grad_checkpointing = False
         self.feature_info = []
 
@@ -608,15 +626,13 @@ class MetaFormer(nn.Module):
 
         self.stages = nn.Sequential(*stages)
 
-        # if using MlpHead, dropout is handled by MlpHead
+        self.head_hidden_size = self.num_features
         if num_classes > 0:
             if self.use_mlp_head:
                 # FIXME not actually returning mlp hidden state right now as pre-logits.
-                final = MlpHead(self.num_features, num_classes, drop_rate=self.drop_rate, **dd)
-                self.head_hidden_size = self.num_features
+                final = MlpHead(self.num_features, num_classes, **dd)
             else:
                 final = nn.Linear(self.num_features, num_classes, **dd)
-                self.head_hidden_size = self.num_features
         else:
             final = nn.Identity()
 
@@ -624,9 +640,10 @@ class MetaFormer(nn.Module):
             ('global_pool', SelectAdaptivePool2d(pool_type=global_pool)),
             ('norm', output_norm(self.num_features, **dd)),
             ('flatten', nn.Flatten(1) if global_pool else nn.Identity()),
-            ('drop', nn.Dropout(drop_rate) if self.use_mlp_head else nn.Identity()),
+            ('drop', nn.Dropout(drop_rate)),
             ('fc', final)
         ]))
+        assert self.head.global_pool.feat_mult() == 1, 'Pooling that changes the pooled width is not supported.'
 
         self.apply(self._init_weights)
 
@@ -646,17 +663,28 @@ class MetaFormer(nn.Module):
     def get_classifier(self) -> nn.Module:
         return self.head.fc
 
-    def reset_classifier(self, num_classes: int, global_pool: Optional[str] = None, device=None, dtype=None):
+    def reset_classifier(
+            self,
+            num_classes: int,
+            global_pool: Optional[str] = None,
+            reset_other: bool = False,
+            device=None,
+            dtype=None,
+    ):
         dd = get_device_dtype(self, device=device, dtype=dtype)
         self.num_classes = num_classes
         if global_pool is not None:
-            self.head.global_pool = SelectAdaptivePool2d(pool_type=global_pool)
-            self.head.global_pool.train(self.head.training)
+            pool = SelectAdaptivePool2d(pool_type=global_pool)
+            assert pool.feat_mult() == 1, 'Pooling that changes the pooled width is not supported.'
+            self.head.global_pool = pool.train(self.head.training)
             self.head.flatten = nn.Flatten(1) if global_pool else nn.Identity()
             self.head.flatten.train(self.head.training)
+        if reset_other:
+            self.head.norm = nn.Identity()
+            self.head.norm.train(self.head.training)
         if num_classes > 0:
             if self.use_mlp_head:
-                final = MlpHead(self.num_features, num_classes, drop_rate=self.drop_rate, **dd)
+                final = MlpHead(self.num_features, num_classes, **dd)
             else:
                 final = nn.Linear(self.num_features, num_classes, **dd)
         else:
@@ -718,9 +746,13 @@ class MetaFormer(nn.Module):
         """ Prune layers not required for specified intermediates.
         """
         take_indices, max_index = feature_take_indices(len(self.stages), indices)
+        prune_end = max_index < len(self.stages) - 1
         self.stages = self.stages[:max_index + 1]  # truncate blocks w/ stem as idx 0
-        if prune_head:
-            self.reset_classifier(0, '')
+        if prune_end:
+            # features now end at the last kept tap, the head is sized for the final features so it goes too
+            self.num_features = self.head_hidden_size = self.feature_info[max_index]['num_chs']
+        if prune_head or prune_end:
+            self.reset_classifier(0, '', reset_other=True)
         return take_indices
 
     def forward_head(self, x: Tensor, pre_logits: bool = False):

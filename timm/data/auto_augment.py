@@ -597,9 +597,8 @@ def auto_augment_transform(config_str: str, hparams: Optional[Dict] = None):
     Returns:
          A PyTorch compatible Transform
 
-    Examples::
-
-        'original-mstd0.5' results in AutoAugment with original policy, magnitude_std 0.5
+    Examples:
+        - `'original-mstd0.5'` is AutoAugment with the original policy and a magnitude std of 0.5.
     """
     hparams = hparams or dict(_HPARAMS_DEFAULT)  # copy so setdefault() below doesn't mutate the shared default
     config = config_str.split('-')
@@ -783,12 +782,10 @@ def rand_augment_transform(
     Returns:
          A PyTorch compatible Transform
 
-    Examples::
-
-        'rand-m9-n3-mstd0.5' results in RandAugment with magnitude 9, num_layers 3, magnitude_std 0.5
-
-        'rand-mstd1-tweights' results in mag std 1.0, weighted transforms, default mag of 10 and num_layers 2
-
+    Examples:
+        - `'rand-m9-n3-mstd0.5'` is RandAugment with magnitude 9, 3 layers and a magnitude std of 0.5.
+        - `'rand-mstd1-tweights'` is RandAugment with a magnitude std of 1.0 and weighted transform selection, at the
+          default magnitude of 10 and 2 layers.
     """
     hparams = hparams or dict(_HPARAMS_DEFAULT)  # copy so setdefault() below doesn't mutate the shared default
     magnitude = _LEVEL_DENOM  # default to _LEVEL_DENOM for magnitude (currently 10)
@@ -919,8 +916,7 @@ class AugMixAugment:
         # This is a literal adaptation of the paper/official implementation without normalizations and
         # PIL <-> Numpy conversions between every op. It is still quite CPU compute heavy compared to the
         # typical augmentation transforms, could use a GPU / Kornia implementation.
-        img_shape = img.size[0], img.size[1], len(img.getbands())
-        mixed = np.zeros(img_shape, dtype=np.float32)
+        mixed = np.zeros_like(img, dtype=np.float32)
         for mw in mixing_weights:
             depth = self.depth if self.depth > 0 else np.random.randint(1, 4)
             ops = np.random.choice(self.ops, depth, replace=True)

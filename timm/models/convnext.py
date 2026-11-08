@@ -1,7 +1,7 @@
 """ ConvNeXt
 
 Papers:
-* `A ConvNet for the 2020s` - https://arxiv.org/pdf/2201.03545.pdf
+* `A ConvNet for the 2020s` - https://arxiv.org/abs/2201.03545
 @Article{liu2022convnet,
   author  = {Zhuang Liu and Hanzi Mao and Chao-Yuan Wu and Christoph Feichtenhofer and Trevor Darrell and Saining Xie},
   title   = {A ConvNet for the 2020s},
@@ -9,13 +9,18 @@ Papers:
   year    = {2022},
 }
 
-* `ConvNeXt-V2 - Co-designing and Scaling ConvNets with Masked Autoencoders` - https://arxiv.org/abs/2301.00808
+* `ConvNeXt V2: Co-designing and Scaling ConvNets with Masked Autoencoders` - https://arxiv.org/abs/2301.00808
 @article{Woo2023ConvNeXtV2,
   title={ConvNeXt V2: Co-designing and Scaling ConvNets with Masked Autoencoders},
   author={Sanghyun Woo, Shoubhik Debnath, Ronghang Hu, Xinlei Chen, Zhuang Liu, In So Kweon and Saining Xie},
   year={2023},
   journal={arXiv preprint arXiv:2301.00808},
 }
+
+Papers for additional pretrained weights:
+* `Reproducible scaling laws for contrastive language-image learning` - https://arxiv.org/abs/2212.07143 (CLIP)
+* `DINOv3` - https://arxiv.org/abs/2508.10104
+* `Efficient Universal Perception Encoder` - https://arxiv.org/abs/2603.22387 (EUPE)
 
 Original code and weights from:
 * https://github.com/facebookresearch/ConvNeXt, original copyright below
@@ -457,7 +462,7 @@ class ConvNeXt(nn.Module):
             # NOTE feature_info use currently assumes stage 0 == stride 1, rest are stride 2
             self.feature_info += [dict(num_chs=prev_chs, reduction=curr_stride, module=f'stages.{i}')]
         self.stages = nn.Sequential(*stages)
-        self.num_features = self.head_hidden_size = prev_chs
+        self.num_features = prev_chs
 
         # if head_norm_first == true, norm -> global pool -> fc ordering, like most other nets
         # otherwise pool -> norm -> fc, the default ConvNeXt ordering (pretrained FB weights)
@@ -483,7 +488,7 @@ class ConvNeXt(nn.Module):
                 act_layer='gelu',
                 **dd,
             )
-            self.head_hidden_size = self.head.num_features
+        self.head_hidden_size = self.head.num_features
         named_apply(partial(_init_weights, head_init_scale=head_init_scale), self)
 
     @torch.jit.ignore
@@ -520,16 +525,18 @@ class ConvNeXt(nn.Module):
         """Get the classifier module."""
         return self.head.fc
 
-    def reset_classifier(self, num_classes: int, global_pool: Optional[str] = None) -> None:
+    def reset_classifier(self, num_classes: int, global_pool: Optional[str] = None, reset_other: bool = False) -> None:
         """Reset the classifier head.
 
         Args:
             num_classes: Number of classes for new classifier.
             global_pool: Global pooling type.
+            reset_other: Reset the non-classifier head layers (norm, pre-logits).
         """
         dd = get_device_dtype(self)
         self.num_classes = num_classes
-        self.head.reset(num_classes, global_pool, **dd)
+        self.head.reset(num_classes, global_pool, reset_other=reset_other, in_features=self.num_features, **dd)
+        self.head_hidden_size = self.head.num_features
 
     def forward_intermediates(
             self,
@@ -598,11 +605,15 @@ class ConvNeXt(nn.Module):
             List of indices that were kept.
         """
         take_indices, max_index = feature_take_indices(len(self.stages), indices)
+        prune_end = max_index < len(self.stages) - 1
+        if prune_norm or prune_end:
+            self.norm_pre = nn.Identity()  # final norm is sized for (and only applied to) the last stage
         self.stages = self.stages[:max_index + 1]  # truncate blocks w/ stem as idx 0
-        if prune_norm:
-            self.norm_pre = nn.Identity()
-        if prune_head:
-            self.reset_classifier(0, '')
+        if prune_end:
+            # features now end at the last kept tap, the head is sized for the final features so it goes too
+            self.num_features = self.head_hidden_size = self.feature_info[max_index]['num_chs']
+        if prune_head or prune_end:
+            self.reset_classifier(0, '', reset_other=True)
         return take_indices
 
     def forward_features(self, x: torch.Tensor) -> torch.Tensor:
@@ -729,7 +740,7 @@ def _cfgv2(url='', **kwargs):
         'mean': IMAGENET_DEFAULT_MEAN, 'std': IMAGENET_DEFAULT_STD,
         'first_conv': 'stem.0', 'classifier': 'head.fc',
         'license': 'cc-by-nc-4.0', 'paper_ids': 'arXiv:2301.00808',
-        'paper_name': 'ConvNeXt-V2: Co-designing and Scaling ConvNets with Masked Autoencoders',
+        'paper_name': 'ConvNeXt V2: Co-designing and Scaling ConvNets with Masked Autoencoders',
         'origin_url': 'https://github.com/facebookresearch/ConvNeXt-V2',
         **kwargs
     }

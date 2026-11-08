@@ -10,7 +10,9 @@ from .cpubone import *
 from .crossvit import *
 from .csatv2 import *
 from .cspnet import *
+from .cspnext import *
 from .davit import *
+from .deepseek_vit import *
 from .deit import *
 from .densenet import *
 from .dla import *
@@ -19,6 +21,7 @@ from .edgenext import *
 from .efficientformer import *
 from .efficientformer_v2 import *
 from .efficientnet import *
+from .efficientvim import *
 from .efficientvit_mit import *
 from .efficientvit_msra import *
 from .eva import *
@@ -27,12 +30,14 @@ from .fastvit import *
 from .focalnet import *
 from .gcvit import *
 from .gemma4_vit import *
+from .qwen3_vit import *
 from .ghostnet import *
 from .hardcorenas import *
 from .hgnet import *
 from .hiera import *
 from .hieradet_sam2 import *
 from .hrnet import *
+from .iformer import *
 from .inception_next import *
 from .inception_resnet_v2 import *
 from .inception_v3 import *
@@ -102,6 +107,7 @@ from ._builder import (
 )
 from ._factory import (
     create_model as create_model,
+    resolve_model_input_args as resolve_model_input_args,
     parse_model_name as parse_model_name,
     safe_model_name as safe_model_name,
 )
@@ -147,6 +153,12 @@ from ._manipulate import (
     checkpoint_seq as checkpoint_seq,
     checkpoint as checkpoint,
     adapt_input_conv as adapt_input_conv,
+    reparameterize_model as reparameterize_model,
+)
+from ._input import (
+    get_model_args as get_model_args,
+    get_model_input_config as get_model_input_config,
+    get_model_traits as get_model_traits,
 )
 from ._pretrained import (
     PretrainedCfg as PretrainedCfg,

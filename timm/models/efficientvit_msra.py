@@ -1,7 +1,7 @@
 """ EfficientViT (by MSRA)
 
-Paper: `EfficientViT: Memory Efficient Vision Transformer with Cascaded Group Attention`
-    - https://arxiv.org/abs/2305.07027
+Papers:
+* `EfficientViT: Memory Efficient Vision Transformer with Cascaded Group Attention` - https://arxiv.org/abs/2305.07027
 
 Adapted from official impl at https://github.com/microsoft/Cream/tree/main/EfficientViT
 """
@@ -16,9 +16,18 @@ import torch
 import torch.nn as nn
 
 from timm.data import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
-from timm.layers import SqueezeExcite, SelectAdaptivePool2d, trunc_normal_, _assert, get_device_dtype
+from timm.layers import (
+    SqueezeExcite,
+    SelectAdaptivePool2d,
+    trunc_normal_,
+    get_device_dtype,
+    to_2tuple,
+    resize_rel_pos_bias_table_levit,
+)
+from ._input import update_model_input_size
 from ._builder import build_model_with_cfg
 from ._features import feature_take_indices
+from ._features_fx import register_notrace_module
 from ._manipulate import checkpoint, checkpoint_seq
 from ._registry import register_model, generate_default_cfgs
 
@@ -230,13 +239,37 @@ class CascadedGroupAttention(torch.nn.Module):
 
     def init_non_persistent_buffers(self) -> None:
         """Initialize non-persistent buffers."""
+        self.attention_bias_cache = {}
+        self._init_buffers()
+
+    def set_resolution(self, resolution: int) -> None:
+        """Update the (window) resolution, resize the attention biases & regenerate the bias index.
+
+        Args:
+            resolution: New window resolution.
+        """
+        if resolution == self.resolution:
+            return
+        self.resolution = resolution
+        N = resolution * resolution
+        with torch.no_grad():
+            self.attention_biases = torch.nn.Parameter(
+                resize_rel_pos_bias_table_levit(self.attention_biases.T, (N, self.num_heads)).T.contiguous(),
+                requires_grad=self.attention_biases.requires_grad,
+            )
+        self.register_buffer('attention_bias_idxs', self.attention_bias_idxs.new_empty((N, N)), persistent=False)
+        self.attention_bias_cache = {}
         self._init_buffers()
 
     @torch.no_grad()
     def train(self, mode=True):
         super().train(mode)
-        if mode and self.attention_bias_cache:
+        if self.attention_bias_cache:
             self.attention_bias_cache = {}  # clear ab cache
+
+    def _apply(self, fn, *args, **kwargs):
+        self.attention_bias_cache = {}
+        return super()._apply(fn, *args, **kwargs)
 
     def get_attention_biases(self, device: torch.device) -> torch.Tensor:
         if torch.jit.is_tracing() or self.training:
@@ -271,6 +304,7 @@ class CascadedGroupAttention(torch.nn.Module):
         return x
 
 
+@register_notrace_module  # reason: FX can't symbolically trace control flow on input size in forward
 class LocalWindowAttention(torch.nn.Module):
     r""" Local Window Attention.
 
@@ -311,29 +345,36 @@ class LocalWindowAttention(torch.nn.Module):
             **dd,
         )
 
+    def set_input_size(self, resolution: int) -> None:
+        """Update the input feature resolution and the effective (attention) window resolution.
+
+        Args:
+            resolution: New input feature resolution.
+        """
+        self.resolution = resolution
+        self.attn.set_resolution(min(self.window_resolution, resolution))
+
     def forward(self, x):
-        H = W = self.resolution
-        B, C, H_, W_ = x.shape
-        # Only check this for classification models
-        _assert(H == H_, f'input feature has wrong size, expect {(H, W)}, got {(H_, W_)}')
-        _assert(W == W_, f'input feature has wrong size, expect {(H, W)}, got {(H_, W_)}')
-        if H <= self.window_resolution and W <= self.window_resolution:
+        B, C, H, W = x.shape
+        # effective window resolution, smaller than window_resolution if model created w/ small feature size
+        ws = self.attn.resolution
+        if H == ws and W == ws:
             x = self.attn(x)
         else:
             x = x.permute(0, 2, 3, 1)
-            pad_b = (self.window_resolution - H % self.window_resolution) % self.window_resolution
-            pad_r = (self.window_resolution - W % self.window_resolution) % self.window_resolution
+            pad_b = (ws - H % ws) % ws
+            pad_r = (ws - W % ws) % ws
             x = torch.nn.functional.pad(x, (0, 0, 0, pad_r, 0, pad_b))
 
             pH, pW = H + pad_b, W + pad_r
-            nH = pH // self.window_resolution
-            nW = pW // self.window_resolution
+            nH = pH // ws
+            nW = pW // ws
             # window partition, BHWC -> B(nHh)(nWw)C -> BnHnWhwC -> (BnHnW)hwC -> (BnHnW)Chw
-            x = x.view(B, nH, self.window_resolution, nW, self.window_resolution, C).transpose(2, 3)
-            x = x.reshape(B * nH * nW, self.window_resolution, self.window_resolution, C).permute(0, 3, 1, 2)
+            x = x.view(B, nH, ws, nW, ws, C).transpose(2, 3)
+            x = x.reshape(B * nH * nW, ws, ws, C).permute(0, 3, 1, 2)
             x = self.attn(x)
             # window reverse, (BnHnW)Chw -> (BnHnW)hwC -> BnHnWhwC -> B(nHh)(nWw)C -> BHWC
-            x = x.permute(0, 2, 3, 1).view(B, nH, nW, self.window_resolution, self.window_resolution, C)
+            x = x.permute(0, 2, 3, 1).view(B, nH, nW, ws, ws, C)
             x = x.transpose(2, 3).reshape(B, pH, pW, C)
             x = x[:, :H, :W].contiguous()
             x = x.permute(0, 3, 1, 2)
@@ -384,6 +425,10 @@ class EfficientVitBlock(torch.nn.Module):
         self.dw1 = ResidualDrop(ConvNorm(dim, dim, 3, 1, 1, groups=dim, bn_weight_init=0., **dd))
         self.ffn1 = ResidualDrop(ConvMlp(dim, int(dim * 2), **dd))
 
+    def set_input_size(self, resolution: int) -> None:
+        """Update the input feature resolution."""
+        self.mixer.m.set_input_size(resolution)
+
     def forward(self, x):
         return self.ffn1(self.dw1(self.mixer(self.ffn0(self.dw0(x)))))
 
@@ -407,6 +452,7 @@ class EfficientVitStage(torch.nn.Module):
         dd = {'device': device, 'dtype': dtype}
         super().__init__()
         if downsample[0] == 'subsample':
+            self.stride = downsample[1]
             self.resolution = (resolution - 1) // downsample[1] + 1
             down_blocks = []
             down_blocks.append((
@@ -428,6 +474,7 @@ class EfficientVitStage(torch.nn.Module):
         else:
             assert in_dim == out_dim
             self.downsample = nn.Identity()
+            self.stride = 1
             self.resolution = resolution
 
         blocks = []
@@ -443,6 +490,16 @@ class EfficientVitStage(torch.nn.Module):
                 **dd,
             ))
         self.blocks = nn.Sequential(*blocks)
+
+    def set_input_size(self, resolution: int) -> None:
+        """Update the input feature resolution of the stage (and its blocks).
+
+        Args:
+            resolution: New input feature resolution (before any downsample in this stage).
+        """
+        self.resolution = (resolution - 1) // self.stride + 1
+        for block in self.blocks:
+            block.set_input_size(self.resolution)
 
     def forward(self, x):
         x = self.downsample(x)
@@ -473,7 +530,7 @@ class PatchEmbedding(torch.nn.Sequential):
 class EfficientVitMsra(nn.Module):
     def __init__(
             self,
-            img_size: int = 224,
+            img_size: Union[int, Tuple[int, int]] = 224,
             in_chans: int = 3,
             num_classes: int = 1000,
             embed_dim: Tuple[int, ...] = (64, 128, 192),
@@ -498,7 +555,9 @@ class EfficientVitMsra(nn.Module):
         # Patch embedding
         self.patch_embed = PatchEmbedding(in_chans, embed_dim[0], **dd)
         stride = self.patch_embed.patch_size
-        resolution = img_size // self.patch_embed.patch_size
+        # the min dim sets the attention window resolution, as in set_input_size()
+        self.img_size = min(to_2tuple(img_size))
+        resolution = self.img_size // self.patch_embed.patch_size
         attn_ratio = [embed_dim[i] / (key_dim[i] * num_heads[i]) for i in range(len(embed_dim))]
 
         # Build EfficientVit blocks
@@ -528,14 +587,13 @@ class EfficientVitMsra(nn.Module):
             self.feature_info += [dict(num_chs=ed, reduction=stride, module=f'stages.{i}')]
         self.stages = nn.Sequential(*stages)
 
-        if global_pool == 'avg':
-            self.global_pool = SelectAdaptivePool2d(pool_type=global_pool, flatten=True)
-        else:
-            assert num_classes == 0
-            self.global_pool = nn.Identity()
-        self.num_features = self.head_hidden_size = embed_dim[-1]
+        assert global_pool or num_classes == 0, 'A classifier needs pooled features.'
+        # flatten only when pooling, no pooling returns the NCHW features
+        self.global_pool = SelectAdaptivePool2d(pool_type=global_pool, flatten=bool(global_pool))
+        self.num_features = embed_dim[-1]
+        self.head_hidden_size = self.num_features * self.global_pool.feat_mult()
         self.head = NormLinear(
-            self.num_features, num_classes, drop=self.drop_rate, **dd) if num_classes > 0 else torch.nn.Identity()
+            self.head_hidden_size, num_classes, drop=self.drop_rate, **dd) if num_classes > 0 else torch.nn.Identity()
 
         # TODO: skip init when on meta device when safe to do so
         self.init_weights(needs_reset=False)
@@ -546,6 +604,25 @@ class EfficientVitMsra(nn.Module):
     def _init_weights(self, m: nn.Module, needs_reset: bool = True) -> None:
         if needs_reset and hasattr(m, 'reset_parameters'):
             m.reset_parameters()
+
+    def set_input_size(self, img_size: Optional[Union[int, Tuple[int, int]]] = None) -> None:
+        """Update the input image resolution (and so the attention biases where the window shrinks / grows).
+
+        Args:
+            img_size: New input resolution, if None current resolution is used. The min dimension determines
+                the effective window resolution.
+        """
+        if img_size is not None:
+            img_size = to_2tuple(img_size)
+            self.img_size = min(img_size)
+        resolution = self.img_size // self.patch_embed.patch_size
+        for stage in self.stages:
+            stage.set_input_size(resolution)
+            resolution = stage.resolution
+
+        if img_size is not None:
+            # record the full (h, w) size, self.img_size only keeps the min dim that sets the window resolution
+            update_model_input_size(self, img_size)
 
     @torch.jit.ignore
     def no_weight_decay(self):
@@ -572,17 +649,15 @@ class EfficientVitMsra(nn.Module):
 
     def reset_classifier(self, num_classes: int, global_pool: Optional[str] = None):
         dd = get_device_dtype(self)
+        pool_type = self.global_pool.pool_type if global_pool is None else global_pool
+        assert pool_type or num_classes == 0, 'A classifier needs pooled features.'
         self.num_classes = num_classes
         if global_pool is not None:
-            if global_pool == 'avg':
-                self.global_pool = SelectAdaptivePool2d(pool_type=global_pool, flatten=True)
-                self.global_pool.train(self.training)
-            else:
-                assert num_classes == 0
-                self.global_pool = nn.Identity()
-                self.global_pool.train(self.training)
+            self.global_pool = SelectAdaptivePool2d(pool_type=global_pool, flatten=bool(global_pool))
+            self.global_pool.train(self.training)
+        self.head_hidden_size = self.num_features * self.global_pool.feat_mult()
         self.head = NormLinear(
-            self.num_features, num_classes, drop=self.drop_rate, **dd) if num_classes > 0 else torch.nn.Identity()
+            self.head_hidden_size, num_classes, drop=self.drop_rate, **dd) if num_classes > 0 else torch.nn.Identity()
         self.head.train(self.training)
 
     def forward_intermediates(
@@ -640,8 +715,12 @@ class EfficientVitMsra(nn.Module):
         """ Prune layers not required for specified intermediates.
         """
         take_indices, max_index = feature_take_indices(len(self.stages), indices)
+        prune_end = max_index < len(self.stages) - 1
         self.stages = self.stages[:max_index + 1]  # truncate blocks w/ stem as idx 0
-        if prune_head:
+        if prune_end:
+            # features now end at the last kept tap, the head is sized for the final features so it goes too
+            self.num_features = self.head_hidden_size = self.feature_info[max_index]['num_chs']
+        if prune_head or prune_end:
             self.reset_classifier(0, '')
         return take_indices
 
@@ -740,12 +819,26 @@ default_cfgs = generate_default_cfgs({
 })
 
 
+def checkpoint_filter_fn(state_dict, model):
+    """ Resize attention biases when loading weights at a different image size (window resolution may change). """
+    target_sd = model.state_dict()
+    out_dict = {}
+    for k, v in state_dict.items():
+        if k.endswith('attention_bias_idxs'):
+            continue
+        if k.endswith('attention_biases') and k in target_sd and v.shape != target_sd[k].shape:
+            v = resize_rel_pos_bias_table_levit(v.T, target_sd[k].shape[::-1]).T.contiguous()
+        out_dict[k] = v
+    return out_dict
+
+
 def _create_efficientvit_msra(variant, pretrained=False, **kwargs):
     out_indices = kwargs.pop('out_indices', (0, 1, 2))
     model = build_model_with_cfg(
         EfficientVitMsra,
         variant,
         pretrained,
+        pretrained_filter_fn=checkpoint_filter_fn,
         feature_cfg=dict(flatten_sequential=True, out_indices=out_indices),
         **kwargs
     )

@@ -1,7 +1,7 @@
 """ EfficientViT (by MIT Song Han's Lab)
 
-Paper: `Efficientvit: Enhanced linear attention for high-resolution low-computation visual recognition`
-    - https://arxiv.org/abs/2205.14756
+Papers:
+* `EfficientViT: Multi-Scale Linear Attention for High-Resolution Dense Prediction` - https://arxiv.org/abs/2205.14756
 
 Adapted from official impl at https://github.com/mit-han-lab/efficientvit
 """
@@ -19,7 +19,7 @@ from timm.layers import SelectAdaptivePool2d, create_conv2d, GELUTanh, get_devic
 from ._builder import build_model_with_cfg
 from ._features import feature_take_indices
 from ._features_fx import register_notrace_module
-from ._manipulate import checkpoint_seq
+from ._manipulate import checkpoint, checkpoint_seq
 from ._registry import register_model, generate_default_cfgs
 
 
@@ -38,7 +38,7 @@ def val2tuple(x: list or tuple or any, min_len: int = 1, idx_repeat: int = -1):
     return tuple(x)
 
 
-def get_same_padding(kernel_size: int or tuple[int, ...]) -> int or tuple[int, ...]:
+def get_same_padding(kernel_size: Union[int, Tuple[int, ...]]) -> Union[int, Tuple[int, ...]]:
     if isinstance(kernel_size, tuple):
         return tuple([get_same_padding(ks) for ks in kernel_size])
     else:
@@ -379,9 +379,9 @@ class LiteMLA(nn.Module):
         # lightweight global attention
         q = self.kernel_func(q)
         k = self.kernel_func(k)
-        v = F.pad(v, (0, 1), mode="constant", value=1.)
+        v = F.pad(v, (0, 1), mode="constant", value=1.0)
 
-        if not torch.jit.is_scripting():
+        if not torch.jit.is_scripting() and v.device.type != 'meta':
             with torch.autocast(device_type=v.device.type, enabled=False):
                 out = self._attn(q, k, v)
         else:
@@ -718,11 +718,13 @@ class ClassifierHead(nn.Module):
         dd = {'device': device, 'dtype': dtype}
         super().__init__()
         self.widths = widths
+        self.in_features = in_channels
         self.num_features = widths[-1]
 
         assert pool_type, 'Cannot disable pooling'
         self.in_conv = ConvNormAct(in_channels, widths[0], 1, norm_layer=norm_layer, act_layer=act_layer, **dd)
         self.global_pool = SelectAdaptivePool2d(pool_type=pool_type, flatten=True)
+        assert self.global_pool.feat_mult() == 1, 'Pooling that changes the pooled width is not supported.'
         self.classifier = nn.Sequential(
             nn.Linear(widths[0], widths[1], bias=False, **dd),
             nn.LayerNorm(widths[1], eps=norm_eps, **dd),
@@ -735,6 +737,8 @@ class ClassifierHead(nn.Module):
             self,
             num_classes: int,
             pool_type: Optional[str] = None,
+            reset_other: bool = False,
+            in_features: Optional[int] = None,
             device=None,
             dtype=None,
     ):
@@ -742,7 +746,17 @@ class ClassifierHead(nn.Module):
         if pool_type is not None:
             assert pool_type, 'Cannot disable pooling'
             self.global_pool = SelectAdaptivePool2d(pool_type=pool_type, flatten=True,)
+            assert self.global_pool.feat_mult() == 1, 'Pooling that changes the pooled width is not supported.'
             self.global_pool.train(self.training)
+        if reset_other:
+            # remove the pre-logits conv / mlp, leaving pooling and the classifier
+            self.in_conv = nn.Identity()
+            for i in range(3):
+                self.classifier[i] = nn.Identity()
+            self.num_features = self.in_features
+        if in_features is not None and in_features != self.in_features:
+            assert isinstance(self.in_conv, nn.Identity), 'Input features can only change w/ in_conv removed.'
+            self.in_features = self.num_features = in_features
         if num_classes > 0:
             self.classifier[-1] = nn.Linear(self.num_features, num_classes, bias=True, **dd)
             self.classifier[-1].train(self.classifier.training)
@@ -842,10 +856,13 @@ class EfficientVit(nn.Module):
     def get_classifier(self) -> nn.Module:
         return self.head.classifier[-1]
 
-    def reset_classifier(self, num_classes: int, global_pool: Optional[str] = None):
+    def reset_classifier(self, num_classes: int, global_pool: Optional[str] = None, reset_other: bool = False):
         dd = get_device_dtype(self)
         self.num_classes = num_classes
-        self.head.reset(num_classes, global_pool, **dd)
+        self.head.reset(num_classes, global_pool, reset_other=reset_other, in_features=self.num_features, **dd)
+        self.head_hidden_size = self.head.num_features
+        if global_pool is not None:
+            self.global_pool = global_pool  # kept in sync w/ the head, which does the pooling
 
     def forward_intermediates(
             self,
@@ -882,7 +899,7 @@ class EfficientVit(nn.Module):
 
         for feat_idx, stage in enumerate(stages):
             if self.grad_checkpointing and not torch.jit.is_scripting():
-                x = checkpoint_seq(stages, x)
+                x = checkpoint(stage, x)
             else:
                 x = stage(x)
             if feat_idx in take_indices:
@@ -902,9 +919,13 @@ class EfficientVit(nn.Module):
         """ Prune layers not required for specified intermediates.
         """
         take_indices, max_index = feature_take_indices(len(self.stages), indices)
+        prune_end = max_index < len(self.stages) - 1
         self.stages = self.stages[:max_index + 1]  # truncate blocks w/ stem as idx 0
-        if prune_head:
-            self.reset_classifier(0, '')
+        if prune_end:
+            # features now end at the last kept tap, the head is sized for the final features so it goes too
+            self.num_features = self.head_hidden_size = self.feature_info[max_index]['num_chs']
+        if prune_head or prune_end:
+            self.reset_classifier(0, reset_other=True)
         return take_indices
 
     def forward_features(self, x):
@@ -1006,10 +1027,13 @@ class EfficientVitLarge(nn.Module):
     def get_classifier(self) -> nn.Module:
         return self.head.classifier[-1]
 
-    def reset_classifier(self, num_classes: int, global_pool: Optional[str] = None):
+    def reset_classifier(self, num_classes: int, global_pool: Optional[str] = None, reset_other: bool = False):
         dd = get_device_dtype(self)
         self.num_classes = num_classes
-        self.head.reset(num_classes, global_pool, **dd)
+        self.head.reset(num_classes, global_pool, reset_other=reset_other, in_features=self.num_features, **dd)
+        self.head_hidden_size = self.head.num_features
+        if global_pool is not None:
+            self.global_pool = global_pool  # kept in sync w/ the head, which does the pooling
 
     def forward_intermediates(
             self,
@@ -1046,7 +1070,7 @@ class EfficientVitLarge(nn.Module):
 
         for feat_idx, stage in enumerate(stages):
             if self.grad_checkpointing and not torch.jit.is_scripting():
-                x = checkpoint_seq(stages, x)
+                x = checkpoint(stage, x)
             else:
                 x = stage(x)
             if feat_idx in take_indices:
@@ -1066,9 +1090,13 @@ class EfficientVitLarge(nn.Module):
         """ Prune layers not required for specified intermediates.
         """
         take_indices, max_index = feature_take_indices(len(self.stages), indices)
+        prune_end = max_index < len(self.stages) - 1
         self.stages = self.stages[:max_index + 1]  # truncate blocks w/ stem as idx 0
-        if prune_head:
-            self.reset_classifier(0, '')
+        if prune_end:
+            # features now end at the last kept tap, the head is sized for the final features so it goes too
+            self.num_features = self.head_hidden_size = self.feature_info[max_index]['num_chs']
+        if prune_head or prune_end:
+            self.reset_classifier(0, reset_other=True)
         return take_indices
 
     def forward_features(self, x):

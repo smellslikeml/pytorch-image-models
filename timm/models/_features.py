@@ -166,11 +166,13 @@ class FeatureHooks:
         # setup feature hooks
         self._feature_outputs = defaultdict(OrderedDict)
         self._handles = []
+        self._hook_ids = []
         modules = {k: v for k, v in named_modules}
         for i, h in enumerate(hooks):
             hook_name = h if isinstance(h, str) else h['module']
             m = modules[hook_name]
             hook_id = out_map[i] if out_map else hook_name
+            self._hook_ids.append(hook_id)
             hook_fn = partial(self._collect_output_hook, hook_id)
             hook_type = default_hook_type
             if isinstance(h, dict):
@@ -192,7 +194,9 @@ class FeatureHooks:
     def get_output(self, device) -> Dict[str, torch.tensor]:
         output = self._feature_outputs[device]
         self._feature_outputs[device] = OrderedDict()  # clear after reading
-        return output
+        # return in hook registration order, insertion order is not reliable (e.g. grad checkpoint recompute
+        # re-fires hooks after the clear above, leaving stale keys in their old positions for the next forward)
+        return OrderedDict((k, output[k]) for k in self._hook_ids if k in output)
 
 
 def _module_list(module, flatten_sequential=False):
@@ -292,9 +296,12 @@ class FeatureDictNet(nn.ModuleDict):
             if self.grad_checkpointing and not torch.jit.is_scripting():
                 # Skipping checkpoint of first module because need a gradient at input
                 # Skipping last because networks with in-place ops might fail w/ checkpointing enabled
+                # Skipping in-place modules (e.g. a stem's ReLU(inplace=True)): checkpointing one on its own modifies
+                # the tensor saved for recompute and fails in backward, and there is nothing to save by checkpointing it
                 # NOTE: first_or_last module could be static, but recalc in is_scripting guard to avoid jit issues
                 first_or_last_module = i == 0 or i == max(len(self) - 1, 0)
-                x = module(x) if first_or_last_module else checkpoint(module, x)
+                skip = first_or_last_module or getattr(module, 'inplace', False) is True
+                x = module(x) if skip else checkpoint(module, x)
             else:
                 x = module(x)
 
@@ -423,9 +430,12 @@ class FeatureHookNet(nn.ModuleDict):
             if self.grad_checkpointing and not torch.jit.is_scripting():
                 # Skipping checkpoint of first module because need a gradient at input
                 # Skipping last because networks with in-place ops might fail w/ checkpointing enabled
+                # Skipping in-place modules (e.g. a stem's ReLU(inplace=True)): checkpointing one on its own modifies
+                # the tensor saved for recompute and fails in backward, and there is nothing to save by checkpointing it
                 # NOTE: first_or_last module could be static, but recalc in is_scripting guard to avoid jit issues
                 first_or_last_module = i == 0 or i == max(len(self) - 1, 0)
-                x = module(x) if first_or_last_module else checkpoint(module, x)
+                skip = first_or_last_module or getattr(module, 'inplace', False) is True
+                x = module(x) if skip else checkpoint(module, x)
             else:
                 x = module(x)
         out = self.hooks.get_output(x.device)
@@ -465,6 +475,11 @@ class FeatureGetterNet(nn.ModuleDict):
                 prune_norm=not norm,
             )
         self.feature_info = _get_feature_info(model, out_indices)
+        if norm:
+            # Normalization can include a projection (e.g. SAM's neck). Keep the model's raw metadata unchanged.
+            self.feature_info = self.feature_info.from_other(out_indices)
+            for info in self.feature_info.info:
+                info['num_chs'] = info.get('num_chs_norm', info['num_chs'])
         self.model = model
         self.out_indices = out_indices
         self.out_map = out_map

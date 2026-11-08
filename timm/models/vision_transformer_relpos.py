@@ -2,6 +2,10 @@
 
 NOTE: these models are experimental / WIP, expect changes
 
+Papers:
+* `An Image is Worth 16x16 Words: Transformers for Image Recognition at Scale` - https://arxiv.org/abs/2010.11929
+* `Swin Transformer V2: Scaling Up Capacity and Resolution` - https://arxiv.org/abs/2111.09883
+
 Hacked together by / Copyright 2022, Ross Wightman
 """
 import logging
@@ -20,6 +24,7 @@ from torch.jit import Final
 
 from timm.data import IMAGENET_INCEPTION_MEAN, IMAGENET_INCEPTION_STD
 from timm.layers import (
+    resize_rel_pos_bias_table,
     get_device_dtype,
     PatchEmbed,
     Mlp,
@@ -31,6 +36,7 @@ from timm.layers import (
     use_fused_attn,
     LayerType,
 )
+from ._input import update_model_input_size
 from ._builder import build_model_with_cfg
 from ._features import feature_take_indices
 from ._manipulate import named_apply, checkpoint
@@ -298,8 +304,8 @@ class VisionTransformerRelPos(nn.Module):
         """
         super().__init__()
         dd = {'device': device, 'dtype': dtype}
-        assert global_pool in ('', 'avg', 'token')
-        assert class_token or global_pool != 'token'
+        assert global_pool in ('', 'avg', 'token'), 'Only avg or token pooling (or none) is supported.'
+        assert class_token or global_pool != 'token', 'Token pooling needs the class token.'
         norm_layer = norm_layer or partial(nn.LayerNorm, eps=1e-6)
         act_layer = act_layer or nn.GELU
 
@@ -397,6 +403,27 @@ class VisionTransformerRelPos(nn.Module):
         if self.fix_init:
             self.fix_init_weight()
 
+    def set_input_size(
+            self,
+            img_size: Optional[Tuple[int, int]] = None,
+            patch_size: Optional[Tuple[int, int]] = None,
+    ) -> None:
+        """Update the input image resolution and patch size (and so the relative position biases).
+
+        Args:
+            img_size: New input resolution, if None current resolution is used.
+            patch_size: New patch size, if None existing patch size is used.
+        """
+        self.patch_embed.set_input_size(img_size=img_size, patch_size=patch_size)
+        feat_size = self.patch_embed.grid_size
+        if self.shared_rel_pos is not None:
+            self.shared_rel_pos.set_window_size(feat_size)
+        for blk in self.blocks:
+            if blk.attn.rel_pos is not None:
+                blk.attn.rel_pos.set_window_size(feat_size)
+
+        update_model_input_size(self, self.patch_embed.img_size, patch_size=patch_size)
+
     @torch.jit.ignore
     def no_weight_decay(self):
         return {'cls_token'}
@@ -420,7 +447,8 @@ class VisionTransformerRelPos(nn.Module):
         dd = get_device_dtype(self, device=device, dtype=dtype)
         self.num_classes = num_classes
         if global_pool is not None:
-            assert global_pool in ('', 'avg', 'token')
+            assert global_pool in ('', 'avg', 'token'), 'Only avg or token pooling (or none) is supported.'
+            assert global_pool != 'token' or self.cls_token is not None, 'Token pooling needs the class token.'
             self.global_pool = global_pool
         self.head = nn.Linear(self.embed_dim, num_classes, **dd) if num_classes > 0 else nn.Identity()
         self.head.train(self.training)
@@ -537,10 +565,27 @@ class VisionTransformerRelPos(nn.Module):
         return x
 
 
+def checkpoint_filter_fn(state_dict, model):
+    """ Resize relative position bias tables when loading weights at a different image / feature size. """
+    out_dict = {}
+    for k, v in state_dict.items():
+        if k.endswith('relative_position_bias_table'):
+            m = model.get_submodule(k[:-29])
+            if v.shape != m.relative_position_bias_table.shape or m.window_size[0] != m.window_size[1]:
+                v = resize_rel_pos_bias_table(
+                    v,
+                    new_window_size=m.window_size,
+                    new_bias_shape=m.relative_position_bias_table.shape,
+                )
+        out_dict[k] = v
+    return out_dict
+
+
 def _create_vision_transformer_relpos(variant, pretrained=False, **kwargs):
     out_indices = kwargs.pop('out_indices', 3)
     model = build_model_with_cfg(
         VisionTransformerRelPos, variant, pretrained,
+        pretrained_filter_fn=checkpoint_filter_fn,
         feature_cfg=dict(out_indices=out_indices, feature_cls='getter'),
         **kwargs,
     )
@@ -596,6 +641,8 @@ default_cfgs = generate_default_cfgs({
         url='https://github.com/rwightman/pytorch-image-models/releases/download/v0.1-tpu-weights/vit_relpos_medium_patch16_rpn_224-sw-5d2befd8.pth',
         hf_hub_id='timm/'),
     'vit_relpos_base_patch16_rpn_224.untrained': _cfg(),
+
+    'test_vit_relpos.untrained': _cfg(input_size=(3, 160, 160), crop_pct=0.95),
 })
 
 
@@ -741,4 +788,12 @@ def vit_relpos_base_patch16_rpn_224(pretrained=False, **kwargs) -> VisionTransfo
         patch_size=16, embed_dim=768, depth=12, num_heads=12, qkv_bias=False, block_fn=ResPostRelPosBlock)
     model = _create_vision_transformer_relpos(
         'vit_relpos_base_patch16_rpn_224', pretrained=pretrained, **dict(model_args, **kwargs))
+    return model
+
+
+@register_model
+def test_vit_relpos(pretrained: bool = False, **kwargs) -> VisionTransformerRelPos:
+    """ViT-RelPos test model, tiny for unit tests."""
+    model_args = dict(patch_size=16, embed_dim=96, depth=9, num_heads=3, mlp_ratio=2, qkv_bias=False, fc_norm=True)
+    model = _create_vision_transformer_relpos('test_vit_relpos', pretrained=pretrained, **dict(model_args, **kwargs))
     return model

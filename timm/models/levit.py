@@ -1,12 +1,12 @@
 """ LeViT
 
-Paper: `LeViT: a Vision Transformer in ConvNet's Clothing for Faster Inference`
-    - https://arxiv.org/abs/2104.01136
+Papers:
+    * `LeViT: a Vision Transformer in ConvNet's Clothing for Faster Inference` - https://arxiv.org/abs/2104.01136
 
 @article{graham2021levit,
   title={LeViT: a Vision Transformer in ConvNet's Clothing for Faster Inference},
   author={Benjamin Graham and Alaaeldin El-Nouby and Hugo Touvron and Pierre Stock and Armand Joulin and Herv\'e J\'egou and Matthijs Douze},
-  journal={arXiv preprint arXiv:22104.01136},
+  journal={arXiv preprint arXiv:2104.01136},
   year={2021}
 }
 
@@ -263,8 +263,12 @@ class Attention(nn.Module):
     @torch.no_grad()
     def train(self, mode=True):
         super().train(mode)
-        if mode and self.attention_bias_cache:
+        if self.attention_bias_cache:
             self.attention_bias_cache = {}  # clear ab cache
+
+    def _apply(self, fn, *args, **kwargs):
+        self.attention_bias_cache = {}
+        return super()._apply(fn, *args, **kwargs)
 
     def reset_parameters(self) -> None:
         """Initialize parameters and buffers."""
@@ -390,8 +394,12 @@ class AttentionDownsample(nn.Module):
     @torch.no_grad()
     def train(self, mode=True):
         super().train(mode)
-        if mode and self.attention_bias_cache:
+        if self.attention_bias_cache:
             self.attention_bias_cache = {}  # clear ab cache
+
+    def _apply(self, fn, *args, **kwargs):
+        self.attention_bias_cache = {}
+        return super()._apply(fn, *args, **kwargs)
 
     def reset_parameters(self) -> None:
         """Initialize parameters and buffers."""
@@ -692,6 +700,7 @@ class Levit(nn.Module):
         self.use_conv = use_conv
         self.num_classes = num_classes
         self.in_chans = in_chans
+        assert global_pool in ('', 'avg'), 'Only avg pooling (or none) is supported.'
         self.global_pool = global_pool
         self.num_features = self.head_hidden_size = embed_dim[-1]
         self.embed_dim = embed_dim
@@ -764,8 +773,11 @@ class Levit(nn.Module):
     @torch.jit.ignore
     def group_matcher(self, coarse=False):
         matcher = dict(
-            stem=r'^cls_token|pos_embed|patch_embed',  # stem and embed
-            blocks=[(r'^blocks\.(\d+)', None), (r'^norm', (99999,))]
+            stem=r'^stem',  # stem and embed
+            blocks=r'^stages\.(\d+)' if coarse else [
+                (r'^stages\.(\d+)\.downsample', (0,)),
+                (r'^stages\.(\d+)\.blocks\.(\d+)', None),
+            ]
         )
         return matcher
 
@@ -781,6 +793,7 @@ class Levit(nn.Module):
         dd = get_device_dtype(self)
         self.num_classes = num_classes
         if global_pool is not None:
+            assert global_pool in ('', 'avg'), 'Only avg pooling (or none) is supported.'
             self.global_pool = global_pool
         self.head = NormLinear(
             self.num_features, num_classes, drop=self.drop_rate, **dd) if num_classes > 0 else nn.Identity()
@@ -848,8 +861,12 @@ class Levit(nn.Module):
         """ Prune layers not required for specified intermediates.
         """
         take_indices, max_index = feature_take_indices(len(self.stages), indices)
+        prune_end = max_index < len(self.stages) - 1
         self.stages = self.stages[:max_index + 1]  # truncate blocks w/ stem as idx 0
-        if prune_head:
+        if prune_end:
+            # features now end at the last kept tap, the head is sized for the final features so it goes too
+            self.num_features = self.head_hidden_size = self.feature_info[max_index]['num_chs']
+        if prune_head or prune_end:
             self.reset_classifier(0, '')
         return take_indices
 
@@ -878,7 +895,8 @@ class LevitDistilled(Levit):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         dd = {'device': kwargs.get('device', None), 'dtype': kwargs.get('dtype', None)}
-        self.head_dist = NormLinear(self.num_features, self.num_classes, **dd) if self.num_classes > 0 else nn.Identity()
+        self.head_dist = NormLinear(
+            self.num_features, self.num_classes, drop=self.drop_rate, **dd) if self.num_classes > 0 else nn.Identity()
         self.distilled_training = False  # must set this True to train w/ distillation token
 
     @torch.jit.ignore
@@ -889,11 +907,13 @@ class LevitDistilled(Levit):
         dd = get_device_dtype(self)
         self.num_classes = num_classes
         if global_pool is not None:
+            assert global_pool in ('', 'avg'), 'Only avg pooling (or none) is supported.'
             self.global_pool = global_pool
         self.head = NormLinear(
             self.num_features, num_classes, drop=self.drop_rate, **dd) if num_classes > 0 else nn.Identity()
         self.head.train(self.training)
-        self.head_dist = NormLinear(self.num_features, num_classes, **dd) if num_classes > 0 else nn.Identity()
+        self.head_dist = NormLinear(
+            self.num_features, num_classes, drop=self.drop_rate, **dd) if num_classes > 0 else nn.Identity()
         self.head_dist.train(self.training)
 
     @torch.jit.ignore

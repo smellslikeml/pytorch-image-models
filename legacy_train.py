@@ -777,6 +777,7 @@ def main():
         naflex_mode = True
         loader_train = create_naflex_loader(
             dataset=dataset_train,
+            channels=data_config['input_size'][0],
             train_seq_lens=args.naflex_train_seq_lens,
             mixup_fn=naflex_mixup_fn,
             rank=args.rank,
@@ -829,6 +830,7 @@ def main():
             # Use largest sequence length for validation
             loader_eval = create_naflex_loader(
                 dataset=dataset_eval,
+                channels=data_config['input_size'][0],
                 patch_size=model_patch_size,  # Use model's native patch size (already determined above)
                 max_seq_len=args.naflex_max_seq_len,
                 **common_loader_kwargs,
@@ -1120,8 +1122,7 @@ def train_one_epoch(
         last_batch = batch_idx == last_batch_idx
         need_update = last_batch or (batch_idx + 1) % accum_steps == 0
         update_idx = batch_idx // accum_steps
-        if batch_idx >= last_batch_idx_to_accum:
-            accum_steps = last_accum_steps
+        batch_accum_steps = last_accum_steps if batch_idx >= last_batch_idx_to_accum else accum_steps
 
         if not args.prefetcher:
             input, target = input.to(device=device, dtype=model_dtype), target.to(device=device)
@@ -1131,14 +1132,14 @@ def train_one_epoch(
             input = input.contiguous(memory_format=torch.channels_last)
 
         # multiply by accum steps to get equivalent for full update
-        data_time_m.update(accum_steps * (time.time() - data_start_time))
+        data_time_m.update(batch_accum_steps * (time.time() - data_start_time))
 
         def _forward():
             with amp_autocast():
                 output = model(input)
                 _loss = loss_fn(output, target)
-            if accum_steps > 1:
-                _loss /= accum_steps
+            if batch_accum_steps > 1:
+                _loss /= batch_accum_steps
             return _loss
 
         def _backward(_loss):
@@ -1212,7 +1213,7 @@ def train_one_epoch(
                 loss = _forward()
                 _backward(loss)
 
-        losses_m.update(loss.item() * accum_steps, batch_size)
+        losses_m.update(loss.item() * batch_accum_steps, batch_size)
         update_sample_count += global_batch_size
 
         if not need_update:

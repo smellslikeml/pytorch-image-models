@@ -6,12 +6,16 @@ import timm.layers.fast_norm as fast_norm
 from timm.layers import (
     Attention2d,
     AttentionPool2d,
+    BatchNormAct2d,
     ClassifierHead,
     ClNormMlpClassifierHead,
+    HybridEmbed,
     MultiQueryAttentionV2,
     NormMlpClassifierHead,
+    PatchEmbed,
     PatchEmbedInterpolator,
     RotAttentionPool2d,
+    convert_splitbn_model,
     create_act_layer,
     get_act_fn,
     get_act_layer,
@@ -36,6 +40,46 @@ def test_get_device_dtype_prefers_explicit_values():
     dd = get_device_dtype(module, dtype=torch.float16)
 
     assert dd == {'device': module.weight.device, 'dtype': torch.float16}
+
+
+@pytest.mark.parametrize('hybrid', [False, True])
+def test_patch_embed_resize_preserves_parameter_flags(hybrid):
+    if hybrid:
+        module = HybridEmbed(nn.Conv2d(3, 8, 3, stride=2, padding=1), img_size=32, patch_size=4, embed_dim=16)
+    else:
+        module = PatchEmbed(img_size=32, patch_size=4, embed_dim=16)
+    module.eval()
+    module.proj.weight.requires_grad_(False)
+    module.set_input_size(patch_size=2)
+    assert not module.proj.training
+    assert not module.proj.weight.requires_grad
+    assert module.proj.bias.requires_grad
+    module(torch.randn(1, 3, 32, 32)).square().sum().backward()
+    assert module.proj.weight.grad is None
+    assert module.proj.bias.grad is not None
+
+
+def test_hybrid_embed_resize_preserves_backbone_modes():
+    backbone = nn.Sequential(nn.Conv2d(3, 8, 3, stride=2, padding=1), nn.BatchNorm2d(8))
+    module = HybridEmbed(backbone, img_size=32, patch_size=2, embed_dim=16).train()
+    backbone[1].eval()
+    calls = []
+    handle = backbone.register_forward_hook(lambda *_: calls.append(1))
+    try:
+        # Scalar sizes matching the current tuples should also be no-ops.
+        module.set_input_size(img_size=32, patch_size=2)
+        module.set_input_size(img_size=(32, 32), patch_size=(2, 2))
+        assert not calls
+        module.set_input_size(img_size=(64, 64))
+        assert len(calls) == 1
+        assert backbone.training and backbone[0].training
+        assert not backbone[1].training
+        assert backbone[1].num_batches_tracked.item() == 0
+        assert module.img_size == (64, 64)
+        assert module.feature_size == (32, 32)
+        assert module.grid_size == (16, 16)
+    finally:
+        handle.remove()
 
 
 def test_fast_rms_norm2d_returns_apex_result(monkeypatch):
@@ -419,3 +463,62 @@ def test_attn2d(bias, expand_first, head_first, attn_mask):
     o2 = attn(x, mask)
     
     assert torch.allclose(o1, o2, atol=1e-5), f"{torch.abs(o1 - o2).max()}"
+
+
+@pytest.mark.parametrize('pool_type', ['', 'avg'])
+@pytest.mark.parametrize('weight_grad,bias_grad', [(False, False), (False, True), (True, False), (True, True)])
+def test_norm_mlp_pool_reset_preserves_projection_gradients(pool_type, weight_grad, bias_grad):
+    old_pool = 'avg' if not pool_type else ''
+    head = NormMlpClassifierHead(4, 2, hidden_size=3, pool_type=old_pool).eval()
+    old_fc = head.pre_logits.fc
+    old_fc.weight.requires_grad_(weight_grad)
+    old_fc.bias.requires_grad_(bias_grad)
+
+    head.reset(0, pool_type)
+
+    assert head.pre_logits.fc.weight.requires_grad == weight_grad
+    assert head.pre_logits.fc.bias.requires_grad == bias_grad
+    assert not head.pre_logits.fc.training
+    torch.testing.assert_close(head.pre_logits.fc.weight.reshape(old_fc.weight.shape), old_fc.weight)
+    torch.testing.assert_close(head.pre_logits.fc.bias, old_fc.bias)
+    x = torch.randn(2, 4, 3, 3, requires_grad=True)
+    head(x).square().sum().backward()
+    assert x.grad is not None
+    assert (head.pre_logits.fc.weight.grad is not None) == weight_grad
+    assert (head.pre_logits.fc.bias.grad is not None) == bias_grad
+
+
+def test_convnext_frozen_teacher_stays_frozen_without_pool():
+    from timm.models.convnext import ConvNeXt
+
+    # Small ConvNeXt with the same MLP head path as convnext_large_mlp.
+    teacher = ConvNeXt(depths=(1, 1, 1, 1), dims=(8, 16, 24, 32), head_hidden_size=32).eval()
+    teacher.requires_grad_(False)
+    teacher.reset_classifier(0, '')
+
+    assert not any(p.requires_grad for p in teacher.parameters())
+    output = teacher(torch.randn(2, 3, 32, 32))
+    assert output.shape == (2, 32, 1, 1)
+    assert not output.requires_grad
+    assert torch.isfinite(output).all()
+
+
+class _HalfDrop(nn.Module):
+    # deterministic non-identity stand-in for a drop layer
+    def forward(self, x):
+        return x * 0.5
+
+
+def test_convert_splitbn_norm_act():
+    # BatchNormAct2d act and drop must still be applied after conversion to SplitBatchNorm2d
+    model = nn.Sequential(nn.Conv2d(3, 8, 3), BatchNormAct2d(8, act_layer=nn.ReLU, drop_layer=_HalfDrop)).eval()
+    x = torch.randn(4, 3, 8, 8)
+    with torch.no_grad():
+        ref = model(x)
+    keys = set(model.state_dict().keys())
+    model = convert_splitbn_model(model, num_splits=2).eval()
+    with torch.no_grad():
+        out = model(x)
+    torch.testing.assert_close(out, ref)
+    assert keys <= set(model.state_dict().keys())
+    assert model.train()(x).min() >= 0

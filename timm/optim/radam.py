@@ -5,8 +5,12 @@ Paper: `On the Variance of the Adaptive Learning Rate and Beyond` - https://arxi
 NOTE: This impl has been deprecated in favour of torch.optim.RAdam and remains as a reference
 """
 import math
+from typing import Any, Dict
+
 import torch
 from torch.optim.optimizer import Optimizer
+
+from ._helpers import _load_state_dict_preserving_dtypes
 
 
 class RAdamLegacy(Optimizer):
@@ -27,12 +31,18 @@ class RAdamLegacy(Optimizer):
             betas=betas,
             eps=eps,
             weight_decay=weight_decay,
-            buffer=[[None, None, None] for _ in range(10)]
         )
         super(RAdamLegacy, self).__init__(params, defaults)
 
     def __setstate__(self, state):
         super(RAdamLegacy, self).__setstate__(state)
+
+    def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
+        # state is always kept in fp32
+        _load_state_dict_preserving_dtypes(
+            self, state_dict, super().load_state_dict,
+            lambda group, param: {key: torch.float32 for key in ('exp_avg', 'exp_avg_sq')},
+        )
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -69,26 +79,21 @@ class RAdamLegacy(Optimizer):
                 exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
 
                 state['step'] += 1
-                buffered = group['buffer'][int(state['step'] % 10)]
-                if state['step'] == buffered[0]:
-                    num_sma, step_size = buffered[1], buffered[2]
-                else:
-                    buffered[0] = state['step']
-                    beta2_t = beta2 ** state['step']
-                    num_sma_max = 2 / (1 - beta2) - 1
-                    num_sma = num_sma_max - 2 * state['step'] * beta2_t / (1 - beta2_t)
-                    buffered[1] = num_sma
+                # NOTE the original impl cached num_sma / step_size in a buffer shared across all param groups,
+                # with lr and betas baked in, so groups w/ a different lr or betas used the wrong step size.
+                beta2_t = beta2 ** state['step']
+                num_sma_max = 2 / (1 - beta2) - 1
+                num_sma = num_sma_max - 2 * state['step'] * beta2_t / (1 - beta2_t)
 
-                    # more conservative since it's an approximated value
-                    if num_sma >= 5:
-                        step_size = group['lr'] * math.sqrt(
-                            (1 - beta2_t) *
-                            (num_sma - 4) / (num_sma_max - 4) *
-                            (num_sma - 2) / num_sma *
-                            num_sma_max / (num_sma_max - 2)) / (1 - beta1 ** state['step'])
-                    else:
-                        step_size = group['lr'] / (1 - beta1 ** state['step'])
-                    buffered[2] = step_size
+                # more conservative since it's an approximated value
+                if num_sma >= 5:
+                    step_size = group['lr'] * math.sqrt(
+                        (1 - beta2_t) *
+                        (num_sma - 4) / (num_sma_max - 4) *
+                        (num_sma - 2) / num_sma *
+                        num_sma_max / (num_sma_max - 2)) / (1 - beta1 ** state['step'])
+                else:
+                    step_size = group['lr'] / (1 - beta1 ** state['step'])
 
                 if group['weight_decay'] != 0:
                     p_fp32.add_(p_fp32, alpha=-group['weight_decay'] * group['lr'])

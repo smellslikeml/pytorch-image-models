@@ -462,21 +462,25 @@ def _register_adam_variants(registry: OptimizerRegistry) -> None:
             name='adafactor',
             opt_class=Adafactor,
             description='Memory-efficient implementation of Adam with factored gradients',
+            has_betas=True,
         ),
         OptimInfo(
             name='adafactorbv',
             opt_class=AdafactorBigVision,
             description='Big Vision variant of Adafactor with factored gradients, half precision momentum',
+            has_momentum=True,
         ),
         OptimInfo(
             name='adopt',
             opt_class=Adopt,
             description='Modified Adam that can converge with any β2 with the optimal rate',
+            has_betas=True,
         ),
         OptimInfo(
             name='adoptw',
             opt_class=Adopt,
             description='Modified AdamW (decoupled decay) that can converge with any β2 with the optimal rate',
+            has_betas=True,
             defaults={'decoupled': True}
         ),
     ]
@@ -575,6 +579,7 @@ def _register_corrected_decay_optimizers(registry: OptimizerRegistry) -> None:
             name='adoptc',
             opt_class=Adopt,
             description='Adopt with corrected decoupled weight decay (lr²/max_lr scaling)',
+            has_betas=True,
             defaults={'decoupled': True, 'corrected_weight_decay': True}
         ),
         OptimInfo(
@@ -588,6 +593,7 @@ def _register_corrected_decay_optimizers(registry: OptimizerRegistry) -> None:
             name='kronc',
             opt_class=Kron,
             description='PSGD Kron with corrected decoupled weight decay (lr²/max_lr scaling)',
+            has_eps=False,
             has_momentum=True,
             defaults={'decoupled_decay': True, 'corrected_weight_decay': True}
         ),
@@ -614,9 +620,17 @@ def _register_corrected_decay_optimizers(registry: OptimizerRegistry) -> None:
             defaults={'alpha': 0.9, 'decoupled_decay': True, 'corrected_weight_decay': True}
         ),
         OptimInfo(
+            name='novogradc',
+            opt_class=NvNovoGrad,
+            description='NovoGrad with corrected decoupled weight decay (lr²/max_lr scaling)',
+            has_betas=True,
+            defaults={'decoupled_decay': True, 'corrected_weight_decay': True}
+        ),
+        OptimInfo(
             name='adafactorbvc',
             opt_class=AdafactorBigVision,
             description='Adafactor Big Vision with corrected weight decay (lr²/max_lr or lr/max_lr scaling)',
+            has_momentum=True,
             defaults={'corrected_weight_decay': True}
         ),
     ]
@@ -636,6 +650,7 @@ def _register_corrected_decay_optimizers(registry: OptimizerRegistry) -> None:
             name='cadoptc',
             opt_class=Adopt,
             description='Cautious Adopt with corrected decoupled weight decay (lr²/max_lr scaling)',
+            has_betas=True,
             defaults={'decoupled': True, 'caution': True, 'corrected_weight_decay': True}
         ),
         OptimInfo(
@@ -665,6 +680,7 @@ def _register_corrected_decay_optimizers(registry: OptimizerRegistry) -> None:
             name='cadafactorbvc',
             opt_class=AdafactorBigVision,
             description='Cautious Adafactor Big Vision with corrected weight decay',
+            has_momentum=True,
             defaults={'caution': True, 'corrected_weight_decay': True}
         ),
     ]
@@ -678,12 +694,15 @@ def _register_cautious_optimizers(registry: OptimizerRegistry) -> None:
             name='cadafactor',
             opt_class=Adafactor,
             description='Cautious Adafactor',
-            defaults={'caution': True}
+            has_betas=True,
+            # caution is applied to the first moment, enable it (beta1) by default
+            defaults={'caution': True, 'betas': (0.9, 0.999)}
         ),
         OptimInfo(
             name='cadafactorbv',
             opt_class=AdafactorBigVision,
             description='Cautious Big Vision Adafactor',
+            has_momentum=True,
             defaults={'caution': True}
         ),
         OptimInfo(
@@ -697,6 +716,7 @@ def _register_cautious_optimizers(registry: OptimizerRegistry) -> None:
             name='cadopt',
             opt_class=Adopt,
             description='Cautious Adopt',
+            has_betas=True,
             defaults={'caution': True}
         ),
         OptimInfo(
@@ -719,6 +739,7 @@ def _register_cautious_optimizers(registry: OptimizerRegistry) -> None:
             name='cadoptw',
             opt_class=Adopt,
             description='Cautious AdoptW (decoupled decay)',
+            has_betas=True,
             defaults={'decoupled': True, 'caution': True}
         ),
         OptimInfo(
@@ -937,6 +958,13 @@ def _register_other_optimizers(registry: OptimizerRegistry) -> None:
             has_betas=True
         ),
         OptimInfo(
+            name='novogradw',
+            opt_class=NvNovoGrad,
+            description='NovoGrad with decoupled weight decay',
+            has_betas=True,
+            defaults={'decoupled_decay': True}
+        ),
+        OptimInfo(
             name='rmsprop',
             opt_class=torch.optim.RMSprop,
             description='torch.optim.RMSprop, Root Mean Square Propagation',
@@ -949,6 +977,13 @@ def _register_other_optimizers(registry: OptimizerRegistry) -> None:
             description='TensorFlow-style RMSprop implementation, Root Mean Square Propagation',
             has_momentum=True,
             defaults={'alpha': 0.9}
+        ),
+        OptimInfo(
+            name='rmsproptfw',
+            opt_class=RMSpropTF,
+            description='TensorFlow-style RMSprop with decoupled weight decay',
+            has_momentum=True,
+            defaults={'alpha': 0.9, 'decoupled_decay': True}
         ),
     ]
     for opt in other_optimizers:
@@ -1026,7 +1061,7 @@ def _register_bnb_optimizers(registry: OptimizerRegistry) -> None:
         ),
         OptimInfo(
             name='bnbadam8bit',
-            opt_class='bitsandbytes.optim.Adam',
+            opt_class='bitsandbytes.optim.Adam8bit',
             description='bitsandbytes 8-bit Adam with dynamic quantization',
             has_betas=True
         ),
@@ -1038,7 +1073,7 @@ def _register_bnb_optimizers(registry: OptimizerRegistry) -> None:
         ),
         OptimInfo(
             name='bnbadamw8bit',
-            opt_class='bitsandbytes.optim.AdamW',
+            opt_class='bitsandbytes.optim.AdamW8bit',
             description='bitsandbytes 8-bit AdamW with dynamic quantization',
             has_betas=True
         ),
@@ -1126,6 +1161,8 @@ def list_optimizers(
             List of tuples of (name, description) (e.g., [('adam', 'Adaptive Moment...'), ...])
 
     Examples:
+
+        ```python
         >>> list_optimizers()
         ['adam', 'adamw', 'sgd', ...]
 
@@ -1140,6 +1177,7 @@ def list_optimizers(
          ('adadelta', 'torch.optim Adadelta, Adapts learning rates based on running windows of gradients'),
          ('adafactor', 'Memory-efficient implementation of Adam with factored gradients'),
         ...]
+        ```
     """
     return default_registry.list_optimizers(filter, exclude_filters, with_description)
 
@@ -1184,14 +1222,19 @@ def get_optimizer_class(
         ValueError: If optimizer name is not found in registry
 
     Examples:
-        >>> # Get SGD with nesterov momentum default
-        >>> SGD = get_optimizer_class('sgd')  # nesterov=True bound
-        >>> opt = SGD(model.parameters(), lr=0.1, momentum=0.9)
+        With the registry defaults bound, `sgd` has nesterov momentum enabled:
 
-        >>> # Get raw optimizer class
-        >>> SGD = get_optimizer_class('sgd')
-        >>> opt = SGD(model.parameters(), lr=1e-3, momentum=0.9)
+        ```python
+        SGD = get_optimizer_class('sgd')
+        opt = SGD(model.parameters(), lr=0.1, momentum=0.9)
+        ```
 
+        The raw optimizer class:
+
+        ```python
+        SGD = get_optimizer_class('sgd', bind_defaults=False)
+        opt = SGD(model.parameters(), lr=1e-3, momentum=0.9, nesterov=True)
+        ```
     """
     return default_registry.get_optimizer_class(name, bind_defaults=bind_defaults)
 
@@ -1248,28 +1291,35 @@ def create_optimizer_v2(
         Configured optimizer instance.
 
     Examples:
-        >>> # Basic usage with a model
-        >>> optimizer = create_optimizer_v2(model, 'adamw', lr=1e-3)
+        AdamW from a model, the parameter groups are created automatically:
 
-        >>> # SGD with momentum and weight decay
-        >>> optimizer = create_optimizer_v2(
-        ...     model, 'sgd', lr=0.1, momentum=0.9, weight_decay=1e-4
-        ... )
+        ```python
+        optimizer = create_optimizer_v2(model, 'adamw', lr=1e-3)
+        ```
 
-        >>> # Adam with layer-wise learning rate decay
-        >>> optimizer = create_optimizer_v2(
-        ...     model, 'adam', lr=1e-3, layer_decay=0.7
-        ... )
+        SGD with momentum and weight decay:
 
-        >>> # Custom parameter groups
-        >>> def group_fn(model):
-        ...     return [
-        ...         {'params': model.backbone.parameters(), 'lr': 1e-4},
-        ...         {'params': model.head.parameters(), 'lr': 1e-3}
-        ...     ]
-        >>> optimizer = create_optimizer_v2(
-        ...     model, 'sgd', param_group_fn=group_fn
-        ... )
+        ```python
+        optimizer = create_optimizer_v2(model, 'sgd', lr=0.1, momentum=0.9, weight_decay=1e-4)
+        ```
+
+        Adam with layer-wise learning rate decay:
+
+        ```python
+        optimizer = create_optimizer_v2(model, 'adam', lr=1e-3, layer_decay=0.7)
+        ```
+
+        Custom parameter groups:
+
+        ```python
+        def group_fn(model):
+            return [
+                {'params': model.backbone.parameters(), 'lr': 1e-4},
+                {'params': model.head.parameters(), 'lr': 1e-3},
+            ]
+
+        optimizer = create_optimizer_v2(model, 'sgd', param_group_fn=group_fn)
+        ```
 
     Note:
         Parameter group handling precedence:

@@ -1,6 +1,8 @@
 """ Res2Net and Res2NeXt
 Adapted from Official Pytorch impl at: https://github.com/gasvn/Res2Net/
-Paper: `Res2Net: A New Multi-scale Backbone Architecture` - https://arxiv.org/abs/1904.01169
+
+Papers:
+* `Res2Net: A New Multi-scale Backbone Architecture` - https://arxiv.org/abs/1904.01169
 """
 import math
 from typing import Optional, Type
@@ -36,6 +38,8 @@ class Bottle2neck(nn.Module):
             act_layer: Type[nn.Module] = nn.ReLU,
             norm_layer: Optional[Type[nn.Module]] = None,
             attn_layer: Optional[Type[nn.Module]] = None,
+            drop_block: Optional[Type[nn.Module]] = None,
+            drop_path: Optional[nn.Module] = None,
             device=None,
             dtype=None,
             **_,
@@ -70,6 +74,7 @@ class Bottle2neck(nn.Module):
             bns.append(norm_layer(width, **dd))
         self.convs = nn.ModuleList(convs)
         self.bns = nn.ModuleList(bns)
+        self.drop_block = drop_block() if drop_block is not None else nn.Identity()
         if self.is_first:
             # FIXME this should probably have count_include_pad=False, but hurts original weights
             self.pool = nn.AvgPool2d(kernel_size=3, stride=stride, padding=1)
@@ -82,6 +87,7 @@ class Bottle2neck(nn.Module):
 
         self.relu = act_layer(inplace=True)
         self.downsample = downsample
+        self.drop_path = drop_path
 
     def zero_init_last(self):
         if getattr(self.bn3, 'weight', None) is not None:
@@ -112,12 +118,16 @@ class Bottle2neck(nn.Module):
             else:
                 spo.append(spx[-1])
         out = torch.cat(spo, 1)
+        out = self.drop_block(out)
 
         out = self.conv3(out)
         out = self.bn3(out)
 
         if self.se is not None:
             out = self.se(out)
+
+        if self.drop_path is not None:
+            out = self.drop_path(out)
 
         if self.downsample is not None:
             shortcut = self.downsample(x)

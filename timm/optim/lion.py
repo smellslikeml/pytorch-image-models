@@ -25,7 +25,9 @@ from typing import List, Optional, Tuple
 import torch
 from torch.optim.optimizer import Optimizer
 
-from ._helpers import _add_scaled_, _validate_scalar
+from ._helpers import (
+    _add_scaled_, _foreach_chunked, _foreach_lerp, _foreach_lerp_, _max_lr_snapshot, _resolve_foreach, _validate_scalar,
+)
 from ._types import ParamsT
 
 
@@ -65,6 +67,7 @@ class Lion(Optimizer):
             weight_decay=weight_decay,
             caution=caution,
             corrected_weight_decay=corrected_weight_decay,
+            max_lr_snapshot=_max_lr_snapshot(lr, corrected_weight_decay),
             foreach=foreach,
             maximize=maximize,
         )
@@ -72,9 +75,11 @@ class Lion(Optimizer):
 
     def __setstate__(self, state):
         super().__setstate__(state)
+        self.defaults.setdefault('max_lr_snapshot', _max_lr_snapshot(self.defaults['lr']))  # pickled pre-snapshot
         for group in self.param_groups:
             group.setdefault('caution', False)
             group.setdefault('corrected_weight_decay', False)
+            group.setdefault('max_lr_snapshot', self.defaults['max_lr_snapshot'])
             group.setdefault('maximize', False)
             group.setdefault('foreach', None)
 
@@ -126,7 +131,7 @@ class Lion(Optimizer):
                 caution=group['caution'],
                 maximize=group['maximize'],
                 foreach=group['foreach'],
-                max_lr=self.defaults['lr'] if group['corrected_weight_decay'] else None,
+                max_lr=group['max_lr_snapshot'] if group['corrected_weight_decay'] else None,
             )
 
         return loss
@@ -150,14 +155,7 @@ def lion(
 ):
     r"""Functional API that performs Lion algorithm computation.
     """
-    if foreach is None:
-        try:
-            # cannot do foreach if this overload doesn't exist when caution enabled
-            foreach = not caution or 'Scalar' in torch.ops.aten._foreach_maximum_.overloads()
-            if foreach and torch.is_tensor(lr):
-                foreach = False
-        except Exception:
-            foreach = False
+    foreach = _resolve_foreach(foreach, caution, lr, params)
 
     if foreach and torch.jit.is_scripting():
         raise RuntimeError('torch.jit.script not supported with foreach optimizers')
@@ -208,7 +206,7 @@ def _single_tensor_lion(
         param.mul_(1 - wd_scale * weight_decay)
 
         # Weight update
-        update = exp_avg.mul(beta1).add_(grad, alpha=1 - beta1).sign_()
+        update = exp_avg.lerp(grad, 1 - beta1).sign_()
 
         if caution:
             # Apply caution as per 'Cautious Optimizers' - https://arxiv.org/abs/2411.16085
@@ -222,6 +220,7 @@ def _single_tensor_lion(
         exp_avg.lerp_(grad, 1 - beta2)
 
 
+@_foreach_chunked(3)
 def _multi_tensor_lion(
         params: List[torch.Tensor],
         grads: List[torch.Tensor],
@@ -250,8 +249,7 @@ def _multi_tensor_lion(
     torch._foreach_mul_(params, 1 - wd_scale * weight_decay)
 
     # Weight update
-    updates = torch._foreach_mul(exp_avgs, beta1)
-    torch._foreach_add_(updates, grads, alpha=1 - beta1)
+    updates = _foreach_lerp(exp_avgs, grads, 1 - beta1)
     updates = [u.sign_() for u in updates]
 
     if caution:
@@ -266,5 +264,4 @@ def _multi_tensor_lion(
     torch._foreach_add_(params, updates, alpha=-lr)
 
     # Decay the momentum running average coefficient
-    torch._foreach_mul_(exp_avgs, beta2)
-    torch._foreach_add_(exp_avgs, grads, alpha=1 - beta2)
+    _foreach_lerp_(exp_avgs, grads, 1 - beta2)

@@ -2,7 +2,8 @@
 
 From scratch implementation of GCViT in the style of timm swin_transformer_v2_cr.py
 
-Global Context Vision Transformers -https://arxiv.org/abs/2206.09959
+Papers:
+* `Global Context Vision Transformers` - https://arxiv.org/abs/2206.09959
 
 @article{hatamizadeh2022global,
   title={Global Context Vision Transformers},
@@ -218,7 +219,8 @@ class WindowAttentionGlobal(nn.Module):
             kv = kv.reshape(B, N, 2, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
             k, v = kv.unbind(0)
 
-            q = q_global.repeat(B // q_global.shape[0], 1, 1, 1)
+            # windows are image-major (all windows of image 0, then image 1, ...): keep each image's global query with them
+            q = q_global.repeat_interleave(B // q_global.shape[0], dim=0)
             q = q.reshape(B, N, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
         else:
             qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
@@ -437,7 +439,7 @@ class GlobalContextVit(nn.Module):
         self.in_chans = in_chans
         self.drop_rate = drop_rate
         num_stages = len(depths)
-        self.num_features = self.head_hidden_size = int(embed_dim * 2 ** (num_stages - 1))
+        self.num_features = int(embed_dim * 2 ** (num_stages - 1))
         if window_size is not None:
             window_size = to_ntuple(num_stages)(window_size)
         else:
@@ -481,6 +483,7 @@ class GlobalContextVit(nn.Module):
 
         # Classifier head
         self.head = ClassifierHead(self.num_features, num_classes, pool_type=global_pool, drop_rate=drop_rate, **dd)
+        self.head_hidden_size = self.head.num_features
 
         if weight_init:
             named_apply(partial(self._init_weights, scheme=weight_init), self)
@@ -531,6 +534,8 @@ class GlobalContextVit(nn.Module):
             global_pool = self.head.global_pool.pool_type
         self.head = ClassifierHead(self.num_features, num_classes, pool_type=global_pool, drop_rate=self.drop_rate, **dd)
         self.head.train(self.training)
+        self.head_hidden_size = self.head.num_features
+        self.global_pool = global_pool  # kept in sync w/ the head, which does the pooling
 
     def forward_intermediates(
             self,
@@ -583,8 +588,12 @@ class GlobalContextVit(nn.Module):
         """ Prune layers not required for specified intermediates.
         """
         take_indices, max_index = feature_take_indices(len(self.stages), indices)
+        prune_end = max_index < len(self.stages) - 1
         self.stages = self.stages[:max_index + 1]  # truncate blocks w/ stem as idx 0
-        if prune_head:
+        if prune_end:
+            # features now end at the last kept tap, the head is sized for the final features so it goes too
+            self.num_features = self.head_hidden_size = self.feature_info[max_index]['num_chs']
+        if prune_head or prune_end:
             self.reset_classifier(0, '')
         return take_indices
 

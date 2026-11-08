@@ -1,10 +1,13 @@
 """RegNet X, Y, Z, and more
 
-Paper: `Designing Network Design Spaces` - https://arxiv.org/abs/2003.13678
-Original Impl: https://github.com/facebookresearch/pycls/blob/master/pycls/models/regnet.py
-
-Paper: `Fast and Accurate Model Scaling` - https://arxiv.org/abs/2103.06877
-Original Impl: None
+Papers:
+    * `Designing Network Design Spaces` - https://arxiv.org/abs/2003.13678
+      Original Impl: https://github.com/facebookresearch/pycls/blob/master/pycls/models/regnet.py
+    * `Fast and Accurate Model Scaling` - https://arxiv.org/abs/2103.06877
+      Original Impl: None
+    * `Self-supervised Pretraining of Visual Features in the Wild` - https://arxiv.org/abs/2103.01988 (SEER weights)
+    * `Revisiting Weakly Supervised Pre-Training of Visual Perception Models` - https://arxiv.org/abs/2201.08371
+      (SWAG weights)
 
 Based on original PyTorch impl linked above, but re-wrote to use my own blocks (adapted from ResNet here)
 and cleaned up with more descriptive variable names.
@@ -128,11 +131,11 @@ def generate_regnet(
     # TODO dWr scaling?
     # depth = int(depth * (scale ** 0.1))
     # width_scale = scale ** 0.4  # dWr scale, exp 0.8 / 2, applied to both group and layer widths
-    widths_cont = torch.arange(depth, dtype=torch.float32) * width_slope + width_initial
+    widths_cont = torch.arange(depth, device='cpu', dtype=torch.float32) * width_slope + width_initial
     width_exps = torch.round(torch.log(widths_cont / width_initial) / math.log(width_mult))
     widths = torch.round((width_initial * torch.pow(width_mult, width_exps)) / quant) * quant
     num_stages, max_stage = len(torch.unique(widths)), int(width_exps.max().item()) + 1
-    groups = torch.tensor([group_size for _ in range(num_stages)], dtype=torch.int32)
+    groups = torch.tensor([group_size for _ in range(num_stages)], device='cpu', dtype=torch.int32)
     return widths.int().tolist(), num_stages, groups.tolist()
 
 
@@ -635,7 +638,6 @@ class RegNet(nn.Module):
             final_act = cfg.linear_out or cfg.preact
             self.final_conv = get_act_layer(cfg.act_layer)() if final_act else nn.Identity()
             self.num_features = prev_width
-        self.head_hidden_size = self.num_features
         self.head = ClassifierHead(
             in_features=self.num_features,
             num_classes=num_classes,
@@ -643,6 +645,7 @@ class RegNet(nn.Module):
             drop_rate=drop_rate,
             **dd,
         )
+        self.head_hidden_size = self.head.num_features
 
         named_apply(partial(_init_weights, zero_init_last=zero_init_last), self)
 
@@ -668,7 +671,7 @@ class RegNet(nn.Module):
         widths, num_stages, stage_gs = generate_regnet(cfg.wa, cfg.w0, cfg.wm, cfg.depth, cfg.group_size)
 
         # Convert to per stage format
-        stage_widths, stage_depths = torch.unique(torch.tensor(widths), return_counts=True)
+        stage_widths, stage_depths = torch.unique(torch.tensor(widths, device='cpu'), return_counts=True)
         stage_widths, stage_depths = stage_widths.tolist(), stage_depths.tolist()
         stage_br = [cfg.bottle_ratio for _ in range(num_stages)]
         stage_strides = []
@@ -730,7 +733,8 @@ class RegNet(nn.Module):
         """
         dd = get_device_dtype(self)
         self.num_classes = num_classes
-        self.head.reset(num_classes, pool_type=global_pool, **dd)
+        self.head.reset(num_classes, pool_type=global_pool, in_features=self.num_features, **dd)
+        self.head_hidden_size = self.head.num_features
 
     def forward_intermediates(
             self,
@@ -797,13 +801,18 @@ class RegNet(nn.Module):
             List of indices that were kept.
         """
         take_indices, max_index = feature_take_indices(5, indices)
+        # final conv (w/ norm) never feeds the features (norm or not), it's removed w/ the head or norm
+        prune_end = max_index < 4 or ((prune_norm or prune_head) and isinstance(self.final_conv, ConvNormAct))
         layer_names = ('s1', 's2', 's3', 's4')
         layer_names = layer_names[max_index:]
         for n in layer_names:
             setattr(self, n, nn.Identity())
-        if max_index < 4:
+        if prune_end:
+            # final conv (w/ norm) follows the last stage and isn't part of the features, like EfficientNet conv_head
             self.final_conv = nn.Identity()
-        if prune_head:
+            # features now end at the last kept tap, the head is sized for the final features so it goes too
+            self.num_features = self.head_hidden_size = self.feature_info[max_index]['num_chs']
+        if prune_head or prune_end:
             self.reset_classifier(0, '')
         return take_indices
 

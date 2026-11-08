@@ -60,7 +60,11 @@ parser.add_argument('--training', default=False, action='store_true',
 parser.add_argument('--verbose', default=False, action='store_true',
                     help='Extra stdout output')
 parser.add_argument('--dynamo', default=False, action='store_true',
-                    help='Use torch dynamo export.')
+                    help='Use torch.export (dynamo) based ONNX exporter instead of TorchScript exporter.')
+parser.add_argument('--external-data', default=None, action='store_true',
+                    help='Save weights to separate external data file (dynamo only, default: only if > 2GB).')
+parser.add_argument('--no-optimize', dest='optimize', default=True, action='store_false',
+                    help='Disable ONNX graph optimization after export (dynamo only).')
 
 def main():
     args = parser.parse_args()
@@ -84,6 +88,12 @@ def main():
     if args.reparam:
         model = reparameterize_model(model)
 
+    # With --dynamo --dynamic-size, windowed models (Swin, MaxViT, TinyViT, EfficientViT)
+    # may need a larger export example, e.g. --img-size 448 or --input-size 3 512 512,
+    # compatible with the model's strides/windows. A single window/partition at a stage
+    # can make Dynamo specialize intermediate size-1 dimensions despite dynamic H/W.
+    # Choose a size with multiple windows at the deepest stage and validate the intended
+    # runtime shapes; a larger example does not remove other model/exporter constraints.
     if args.input_size is not None:
         assert len(args.input_size) == 3, 'input-size should be N H W (channels, height, width)'
         input_size = args.input_size
@@ -103,6 +113,8 @@ def main():
         training=args.training,
         verbose=args.verbose,
         use_dynamo=args.dynamo,
+        external_data=args.external_data,
+        optimize=args.optimize,
         input_size=input_size,
         batch_size=args.batch_size,
     )

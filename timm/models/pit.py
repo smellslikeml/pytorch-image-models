@@ -1,7 +1,7 @@
 """ Pooling-based Vision Transformer (PiT) in PyTorch
 
-A PyTorch implement of Pooling-based Vision Transformers as described in
-'Rethinking Spatial Dimensions of Vision Transformers' - https://arxiv.org/abs/2103.16302
+A PyTorch implement of Pooling-based Vision Transformers as described in:
+* `Rethinking Spatial Dimensions of Vision Transformers` - https://arxiv.org/abs/2103.16302
 
 This code was adapted from the original version at https://github.com/naver-ai/pit, original copyright below.
 
@@ -181,7 +181,7 @@ class PoolingVisionTransformer(nn.Module):
             global_pool: str = 'token',
             distilled: bool = False,
             drop_rate: float = 0.,
-            pos_drop_drate: float = 0.,
+            pos_drop_rate: float = 0.,
             proj_drop_rate: float = 0.,
             attn_drop_rate: float = 0.,
             drop_path_rate: float = 0.,
@@ -190,7 +190,8 @@ class PoolingVisionTransformer(nn.Module):
     ):
         super().__init__()
         dd = {'device': device, 'dtype': dtype}
-        assert global_pool in ('token',)
+        assert global_pool in ('', 'token'), 'Only token pooling (or none) is supported.'
+        assert global_pool == 'token' or not distilled, 'The distilled head needs token pooling.'
 
         self.base_dims = base_dims
         self.heads = heads
@@ -204,7 +205,7 @@ class PoolingVisionTransformer(nn.Module):
         self.patch_embed = ConvEmbedding(in_chans, embed_dim, img_size, patch_size, stride, **dd)
         self.pos_embed = nn.Parameter(torch.randn(1, embed_dim, self.patch_embed.height, self.patch_embed.width, **dd))
         self.cls_token = nn.Parameter(torch.randn(1, self.num_tokens, embed_dim, **dd))
-        self.pos_drop = nn.Dropout(p=pos_drop_drate)
+        self.pos_drop = nn.Dropout(p=pos_drop_rate)
 
         transformers = []
         # stochastic depth decay rule
@@ -232,7 +233,7 @@ class PoolingVisionTransformer(nn.Module):
                 **dd,
             )]
             prev_dim = embed_dim
-            self.feature_info += [dict(num_chs=prev_dim, reduction=(stride - 1) * 2**i, module=f'transformers.{i}')]
+            self.feature_info += [dict(num_chs=prev_dim, reduction=stride * 2**i, module=f'transformers.{i}')]
 
         self.transformers = SequentialTuple(*transformers)
         self.norm = nn.LayerNorm(base_dims[-1] * heads[-1], eps=1e-6, **dd)
@@ -277,11 +278,13 @@ class PoolingVisionTransformer(nn.Module):
         dd = get_device_dtype(self)
         self.num_classes = num_classes
         if global_pool is not None:
+            assert global_pool in ('', 'token'), 'Only token pooling (or none) is supported.'
+            assert global_pool == 'token' or self.head_dist is None, 'The distilled head needs token pooling.'
             self.global_pool = global_pool
-        self.head = nn.Linear(self.embed_dim, num_classes, **dd) if num_classes > 0 else nn.Identity()
+        self.head = nn.Linear(self.num_features, num_classes, **dd) if num_classes > 0 else nn.Identity()
         self.head.train(self.training)
         if self.head_dist is not None:
-            self.head_dist = nn.Linear(self.embed_dim, self.num_classes, **dd) if num_classes > 0 else nn.Identity()
+            self.head_dist = nn.Linear(self.num_features, self.num_classes, **dd) if num_classes > 0 else nn.Identity()
             self.head_dist.train(self.training)
 
     def forward_intermediates(
@@ -342,10 +345,16 @@ class PoolingVisionTransformer(nn.Module):
         """ Prune layers not required for specified intermediates.
         """
         take_indices, max_index = feature_take_indices(len(self.transformers), indices)
-        self.transformers = self.transformers[:max_index + 1]  # truncate blocks w/ stem as idx 0
-        if prune_norm:
+        prune_end = max_index < len(self.transformers) - 1
+        if prune_norm or prune_head or prune_end:
+            # final norm is sized for the last stage and only applied to the class tokens, never the spatial features
             self.norm = nn.Identity()
-        if prune_head:
+        self.transformers = self.transformers[:max_index + 1]  # truncate blocks w/ stem as idx 0
+        if prune_end:
+            # features now end at the last kept tap, the head is sized for the final features so it goes too
+            self.num_features = self.head_hidden_size = self.feature_info[max_index]['num_chs']
+        if prune_head or prune_end:
+            self.head_dist = None  # the distillation head is part of the head
             self.reset_classifier(0, '')
         return take_indices
 

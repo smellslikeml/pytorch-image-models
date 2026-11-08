@@ -14,6 +14,7 @@ from timm.models._helpers import load_state_dict
 from timm.models._hub import has_hf_hub, download_cached_file, check_cached_file, load_state_dict_from_hf, \
     load_state_dict_from_path, load_custom_from_hf
 from timm.models._manipulate import adapt_input_conv
+from timm.models._input import _init_model_traits, get_model_traits
 from timm.models._pretrained import PretrainedCfg
 from timm.models._prune import adapt_model_from_file
 from timm.models._registry import get_pretrained_cfg
@@ -25,6 +26,9 @@ _logger = logging.getLogger(__name__)
 _DOWNLOAD_PROGRESS = False
 _CHECK_HASH = False
 _USE_OLD_CACHE = int(os.environ.get('TIMM_USE_OLD_CACHE', 0)) > 0
+
+# Pretrained cfg keys that locate a weight file whose format custom_load describes.
+_PRETRAINED_SOURCE_KEYS = ('file', 'url', 'hf_hub_id', 'hf_hub_filename')
 
 __all__ = [
     'set_pretrained_download_progress',
@@ -244,21 +248,53 @@ def load_pretrained(
             # for backwards compat with filter fn that take one arg
             state_dict = filter_fn(state_dict)
 
-    input_convs = pretrained_cfg.get('first_conv', None)
-    if input_convs is not None and in_chans != 3:
+    input_convs = get_model_traits(model).get('first_conv', pretrained_cfg.get('first_conv'))
+    pretrained_in_chans = (pretrained_cfg.get('input_size') or (3,))[0]
+    if input_convs is not None:
         if isinstance(input_convs, str):
             input_convs = (input_convs,)
         for input_conv_name in input_convs:
             weight_name = input_conv_name + '.weight'
+            if weight_name not in state_dict:
+                # A model-specific checkpoint filter may have remapped the source stem.
+                # Leave validation of its output to load_state_dict.
+                continue
+            module = model.get_submodule(input_conv_name)
+            weight = state_dict[weight_name]
+            if weight.shape == module.weight.shape:
+                if in_chans != pretrained_in_chans:
+                    _logger.warning(
+                        f'Pretrained {input_conv_name} weights already match the model, but input_size declares '
+                        f'{pretrained_in_chans} source channels and the model has {in_chans}. Loading unchanged.'
+                    )
+                continue
+            if isinstance(module, nn.Conv2d) and weight.ndim == 4:
+                # Validate the declared channels against the known target stem expansion/grouping.
+                # This is a consistency check, not an inference of source channels from tensor shape.
+                if weight.shape[1] * in_chans * module.groups != pretrained_in_chans * module.in_channels:
+                    raise RuntimeError(
+                        f'Pretrained {input_conv_name} weight shape {tuple(weight.shape)} is inconsistent with '
+                        f'input_size[0]={pretrained_in_chans}. Correct the source pretrained_cfg before adapting '
+                        f'to {in_chans} channels.'
+                    )
+            if in_chans == pretrained_in_chans:
+                continue
             try:
-                state_dict[weight_name] = adapt_input_conv(in_chans, state_dict[weight_name])
+                state_dict[weight_name] = adapt_input_conv(
+                    in_chans,
+                    state_dict[weight_name],
+                    base_chans=pretrained_in_chans,
+                )
                 _logger.info(
-                    f'Converted input conv {input_conv_name} pretrained weights from 3 to {in_chans} channel(s)')
+                    f'Converted input conv {input_conv_name} pretrained weights '
+                    f'from {pretrained_in_chans} to {in_chans} channel(s)'
+                )
             except NotImplementedError as e:
                 del state_dict[weight_name]
                 strict = False
                 _logger.warning(
-                    f'Unable to convert pretrained {input_conv_name} weights, using random init for this layer.')
+                    f'Unable to convert pretrained {input_conv_name} weights, using random init for this layer.'
+                )
 
     classifiers = pretrained_cfg.get('classifier', None)
     label_offset = pretrained_cfg.get('label_offset', 0)
@@ -375,9 +411,14 @@ def resolve_pretrained_cfg(
             f" Please add a config to the model pretrained_cfg registry or pass explicitly.")
         pretrained_cfg = PretrainedCfg()  # instance with defaults
 
-    pretrained_cfg_overlay = pretrained_cfg_overlay or {}
+    pretrained_cfg_overlay = dict(pretrained_cfg_overlay or {})
     if not pretrained_cfg.architecture:
         pretrained_cfg_overlay.setdefault('architecture', variant)
+    if any(pretrained_cfg_overlay.get(k) for k in _PRETRAINED_SOURCE_KEYS):
+        # custom_load describes the format of the registry weight source. Supplying a non-empty source
+        # resets it unless explicitly set (e.g. custom_load=True for a local copy of original .npz weights).
+        # Clearing an alternative source preserves it for the remaining registry source.
+        pretrained_cfg_overlay.setdefault('custom_load', False)
     pretrained_cfg = dataclasses.replace(pretrained_cfg, **pretrained_cfg_overlay)
 
     return pretrained_cfg
@@ -395,9 +436,10 @@ def build_model_with_cfg(
         pretrained_filter_fn: Optional[Callable] = None,
         cache_dir: Optional[Union[str, Path]] = None,
         kwargs_filter: Optional[Tuple[str]] = None,
+        pretrained_model_args: Optional[Dict] = None,
         **kwargs,
 ) -> ModelT:
-    """ Build model with specified default_cfg and optional model_cfg
+    """Build model with specified default_cfg and optional model_cfg
 
     This helper fn aids in the construction of a model including:
       * handling default_cfg and associated pretrained weight loading
@@ -417,6 +459,7 @@ def build_model_with_cfg(
         pretrained_filter_fn: Filter callable for pretrained weights
         cache_dir: Override model cache dir for Hugging Face Hub and Torch checkpoints
         kwargs_filter: Kwargs keys to filter (remove) before passing to model
+        pretrained_model_args: Reconstruction arguments describing the source checkpoint.
         **kwargs: Model args passed through to model __init__
     """
     pruned = kwargs.pop('pruned', False)
@@ -448,7 +491,9 @@ def build_model_with_cfg(
     else:
         model = model_cls(cfg=model_cfg, **kwargs)
     model.pretrained_cfg = pretrained_cfg
+    model.pretrained_model_args = pretrained_model_args or {}
     model.default_cfg = model.pretrained_cfg  # alias for backwards compat
+    _init_model_traits(model, kwargs, pretrained_cfg)
 
     if pruned:
         model = adapt_model_from_file(model, variant)
@@ -468,37 +513,40 @@ def build_model_with_cfg(
 
     # Wrap the model in a feature extraction module if enabled
     if features:
-        use_getter = False
-        if 'feature_cls' in feature_cfg:
-            feature_cls = feature_cfg.pop('feature_cls')
-            if isinstance(feature_cls, str):
-                feature_cls = feature_cls.lower()
-
-                # flatten_sequential only valid for some feature extractors
-                if feature_cls not in ('dict', 'list', 'hook'):
-                    feature_cfg.pop('flatten_sequential', None)
-
-                if 'hook' in feature_cls:
-                    feature_cls = FeatureHookNet
-                elif feature_cls == 'list':
-                    feature_cls = FeatureListNet
-                elif feature_cls == 'dict':
-                    feature_cls = FeatureDictNet
-                elif feature_cls == 'fx':
-                    feature_cls = FeatureGraphNet
-                elif feature_cls == 'getter':
-                    use_getter = True
-                    feature_cls = FeatureGetterNet
-                else:
-                    assert False, f'Unknown feature class {feature_cls}'
-        else:
-            feature_cls = FeatureListNet
+        feature_cls = feature_cfg.pop('feature_cls', FeatureListNet)
+        if isinstance(feature_cls, str):
+            feature_cls = feature_cls.lower()
+            if 'hook' in feature_cls:
+                feature_cls = FeatureHookNet
+            elif feature_cls == 'list':
+                feature_cls = FeatureListNet
+            elif feature_cls == 'dict':
+                feature_cls = FeatureDictNet
+            elif feature_cls == 'fx':
+                feature_cls = FeatureGraphNet
+            elif feature_cls == 'getter':
+                feature_cls = FeatureGetterNet
+            else:
+                assert False, f'Unknown feature class {feature_cls}'
+        is_cls = isinstance(feature_cls, type)
+        use_getter = is_cls and issubclass(feature_cls, FeatureGetterNet)
+        # flatten_sequential only valid for some feature extractors, no_rewrite only for the hook extractor
+        if not (is_cls and issubclass(feature_cls, (FeatureDictNet, FeatureHookNet))):
+            feature_cfg.pop('flatten_sequential', None)
+        if not (is_cls and issubclass(feature_cls, FeatureHookNet)):
+            feature_cfg.pop('no_rewrite', None)
 
         output_fmt = getattr(model, 'output_fmt', None)
         if output_fmt is not None and not use_getter:  # don't set default for intermediate feat getter
             feature_cfg.setdefault('output_fmt', output_fmt)
 
+        traits = get_model_traits(model)
+        input_metadata = dict(_traits=dict(model._traits))
+        if 'in_chans' in traits:
+            input_metadata['in_chans'] = traits['in_chans']
         model = feature_cls(model, **feature_cfg)
+        for key, value in input_metadata.items():
+            setattr(model, key, value)
         model.pretrained_cfg = pretrained_cfg_for_features(pretrained_cfg)  # add back pretrained cfg
         model.default_cfg = model.pretrained_cfg  # alias for rename backwards compat (default_cfg -> pretrained_cfg)
 

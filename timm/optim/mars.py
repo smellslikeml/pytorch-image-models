@@ -50,9 +50,8 @@ def _mars_single_tensor_step(
             c_t = grad
         else:
             c_t = (grad - last_grad).mul_(gamma * (beta1 / one_minus_beta1)).add_(grad)
-            c_t_norm = torch.norm(c_t)
-            if c_t_norm > 1.:
-                c_t = c_t / c_t_norm
+        # clip c_t to unit norm, c_t / max(1, ||c_t||), w/o a host sync (no data dependent branch)
+        c_t = c_t / torch.norm(c_t).clamp_(min=1.)  # NOTE not in-place, c_t is grad on the first step
         exp_avg.mul_(beta1).add_(c_t, alpha=one_minus_beta1)
 
         if caution:
@@ -202,6 +201,9 @@ class Mars(Optimizer):
                     caution=group['caution'],
                 )
 
-                state['last_grad'] = grad
+                # Copy the gradient rather than keeping a reference to p.grad. With
+                # zero_grad(set_to_none=False) p.grad is zeroed and accumulated into in place, so a
+                # reference would always equal the current gradient by the time of the next step.
+                state['last_grad'].copy_(grad)
 
         return loss

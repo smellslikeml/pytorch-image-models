@@ -12,6 +12,112 @@
 
 ## What's New
 
+## November 3, 2026
+
+* `reset_classifier()` and checkpoint reconstruction: fixes across ViT, EVA, BEiT, NaFlexViT, RepViT and iFormer
+  preserve normalization placement and distillation settings when exporting / reloading models after changing the
+  classifier or pooling. Also fix unpooled PiT export and EfficientFormerV2 with distillation disabled.
+* NaFlex: fix ViT / EVA norm placement during conversion, support SwiGLU alignment for DINOv3 / Lingbot checkpoints,
+  and preserve grayscale / non-RGB input channels in data loaders.
+* Fix layer-wise LR decay grouping for RepViT, HGNet, MViTv2 and pre-norm ViTs, and InceptionNeXt feature sizes with
+  `output_stride=8/16`.
+* Release 1.0.31.
+
+## October 24, 2026
+
+* `forward_intermediates()` and `prune_intermediate_layers()` are now supported by every model. Newly added for CSPNet, NFNet, DLA, DenseNet (#2870, thanks [ghaith-mq](https://github.com/ghaith-mq)), CoaT, ConViT, ConvMixer, CrossViT, HRNet, Inception-v3, Inception-ResNet-v2, NASNet, PNASNet, SelecSLS, SENet, Sequencer2d, VGG, Visformer, Xception and Aligned Xception, with `prune_intermediate_layers()` for NaFlexViT and MobileNetV5 encoders. CoaT, ConViT, ConvMixer, CrossViT and Visformer gain `features_only` support.
+* `prune_intermediate_layers()` fixes
+  * `prune_head=True` removes the whole head (head norm, pre-logits layers, attention pooling) so the pruned model leaves no unused params (DDP w/o `find_unused_parameters`), except CoaT, CrossViT and HRNet when only some of their parallel scales / branches are taken. Pass `prune_head=False` to keep it.
+  * Pruning a hierarchical model to an earlier stage removes the final norm and head sized for the last stage, `forward_features()` ends at the last kept feature and `num_features` / `head_hidden_size` match it. Pruning to the stem feature removes the stem pooling after it.
+  * Fixes for grad checkpointing, `stop_early`, class token / post network removal, and TorchScript of pruned / `feature_cls='getter'` models across many families.
+* `head_hidden_size` is the actual pre-logits (pooled) width in all models, including concat pooling (`catavgmax`) and after `reset_classifier()`. Pool types a model can't apply now raise at creation / reset instead of being silently ignored or failing in forward.
+* Other fixes: VOLO `num_classes=0` output is the class token embedding (matching `forward_head(pre_logits=True)`), `vit_pe_core` `reset_classifier()` w/ a non `map` pool removes the attention pool, pool type export via `save_for_hf` reads the head's current pooling, and headless (`num_classes=0`) Swin, SwinV2, DaViT and NextViT checkpoints reload correctly.
+
+## October 13, 2026
+
+* Hyperparameter sweeps via a new `sweep.py`: grid / random search over any `train.py` argument, one effective `--config` per job, run on a pool of local GPUs and resumable. WSD sweeps train one stable trunk per hyperparameter combination and branch independent cooldowns from its milestone checkpoints, comparing annealing at several budgets for a fraction of the cost of full runs. See the [training docs](https://huggingface.co/docs/timm/training_script#hyperparameter-sweeps).
+* `train.py`: `--resume auto` resumes in place from the experiment's own `last.pth.tar` (checkpoint history, `model_best` and `summary.csv` stay consistent), `--stop-epoch N` stops without changing the schedule, `--save-epochs N [N ...]` keeps `milestone-N.pth.tar` snapshots, and YAML `--config` values are validated against the script's arguments.
+* Deprecate `PlateauLRScheduler` (`--sched plateau`). `timm` schedulers are stateless functions of the epoch or update count, the metric-driven plateau schedule never fit that and its state is not checkpointed, so resume was never exact. Use `cosine` or `wsd`.
+* Docs: new [Model API](https://huggingface.co/docs/timm/model_api) page, generated model family pages for every model module replacing the old per-model pages, and expanded data / loss / models reference pages.
+* Model API consistency fixes: `reset_classifier()` keeps the current pooling in all models, unknown constructor args raise `TypeError` everywhere, Swin family `dynamic_img_size`, LeViT layer-wise lr decay, `no_weight_decay` names that matched no params (NesT, SwinV2, XCiT, FocalNet), resize state recorded for all `set_input_size` families.
+* Fixes: GCViT global query mixed images within a batch, gradient checkpointing for RDNet and MobileNetV5, `save_for_hf` stale test input size, EfficientViT (MSRA) rectangular resize, ImageDataset image conversion errors (#2846). `reparameterize_model` moved to `timm.models`.
+
+## October 9, 2026
+
+* Add [CSPNeXt](https://arxiv.org/abs/2212.07784) (RTMDet backbone) `cspnext_{tiny,s,m,l,x}` with ImageNet-1k classification weights converted from OpenMMLab. Thanks [Munehiro Kobayashi](https://github.com/munehiro-k).
+* Optimizer improvements
+  * Foreach (multi-tensor) impls for RMSpropTF, LaProp, LAMB, LARS, AdaBelief. Foreach steps are chunked by device L2 cache size (`TIMM_FOREACH_CHUNK_SIZE` to override).
+  * RMS update clipping (`clipping_threshold`) for AdamWLegacy / NAdamW, new decoupled / corrected weight decay NovoGrad variants (`novogradw`, `novogradc`).
+  * Correctness fixes across many optimizers, including corrected weight decay w/ in-place updated tensor lr, FP16 update stalls at small lr, low precision state handling (Kron, AdaBelief, NovoGrad), and no more in-place `p.grad`
+modification.
+  * `torch.compile` / CUDA graph fixes for Adopt, SGDW, AdafactorBV.
+  * New optimizer docs covering usage, naming conventions, and families. 
+* Add WSD (warmup-stable-decay) LR scheduler (`--sched wsd`, `--lr-decay-fn`, `--lr-stable-timescale`).
+* Model EMA fixes for bfloat16 / float16 models. ModelEmaV3 bfloat16 EMAs use stochastic rounding by default, float16 models keep a float32 EMA.
+* Model resizing via `set_input_size()`
+  * Expanded support for windowed models (MaxViT, CoAtNet, BEiT, EfficientViT-MSRA, relpos ViT, Swin family).
+  * Swin / SwinV2 / SwinV2-CR keep each stage's window to grid ratio on resize, a call at the current size is now a no-op. Per-stage `window_size` / `window_ratio` supported. Fixes Swin S3 and SwinV2 `window16` / `window12` models
+changing outputs on a same-size call.
+  * Fix SwinV2 NaN w/ a window size of 1, odd stage feature sizes, and hybrid ViT resize on CUDA / low precision.
+* Fix grad accumulation remainder handling (#2821), distributed sampling / repeated augmentation on small datasets, pretrained source overrides and distillation teacher setup, `train.py` w/ `--sched none`, and eval center crop
+interpolation for non-square inputs.
+* ONNX export compatibility fixes across PyTorch versions, dropout consistency fixes, and more meta-device init fixes.
+  
+## September 25, 2026
+
+* Multi-label classification support
+  * Add `--task multilabel` to `train.py` / `validate.py`, trained with BCE (`MultiLabelClassificationTask`). See the
+    [training docs](https://huggingface.co/docs/timm/training_script) for details.
+  * Targets can be lists of class indices, dense multi-hot vectors (`--target-format multihot`), or one binary field
+    per class (`--target-key a,b,c`), with `/` paths into nested fields. Supported by the `hfds`, `hfids`, `tfds`
+    (multi-field keys), and `wds` readers.
+  * Mixup / CutMix and NaFlex loaders support multi-label targets. Label smoothing moves each target towards 0.5
+    and defaults to 0 for multi-label.
+  * Validation reports mAP (the default `--eval-metric`) plus micro, macro, and sample F1, with an F1 threshold set by
+    `--multilabel-threshold`.
+  * New dataset-level evaluators compute metrics over the full validation set across distributed ranks, excluding
+    distributed sampler padding.
+  * See the [timm multi-label image datasets](https://huggingface.co/collections/timm/timm-multi-label-image-datasets)
+    collection on the Hub for example / benchmark datasets that work out of the box.
+* New loss options via `--loss`
+  * Poly-1, Two-way, ZLPR, and Distribution-Balanced losses.
+  * Class-frequency weighting for BCE / ASL, computed from label counts gathered by `class_weights.py`.
+  * ASL is now fp16-safe and defaults to `batchmean` reduction
+* RoPE Refactor
+  * Extend training-only RoPE coordinate augmentation (shift, jitter, rescale) to axial, mixed, and MRoPE embeddings,
+    sharing helpers with DINOv3 while preserving its existing augmentation behavior.
+  * Add `grid_type` and `normalize_coords` options to the Fourier / rotary builders (`build_fourier_pos_embed`,
+    `build_rotary_pos_embed`) and axial RoPE modules, and configurable MRoPE sections in EVA.
+  * Support `rotate_half` in the tuple-output `RotaryEmbedding` and the `base` factory variant.
+  * Correct rotation-layout forwarding in EVA, NaFlexViT, and MRoPE attention pooling.
+  * Keep non-learned RoPE frequency and coordinate buffers at least float32 in half/bfloat16 models, and compute mixed
+    RoPE phases in float32 under autocast. These precision fixes can change low-precision model outputs.
+  * Fix batched RoPE embeddings for pixel grids and reference-shape rescaling. DINOv3 `grid_indexing='xy'` now swaps
+    coordinate channels as requested; outputs for these previously incorrect configurations change.
+  * Make `apply_rot_embed`, `apply_rot_embed_cat`, and `apply_rot_embed_list` return each input's dtype, casting after
+    the rotation without first downcasting sin/cos.
+  * Consolidate the two axial RoPE modules behind a private base. Existing calls remain compatible, but the `bands`
+    buffer is now retained in both cached and dynamic modes (`rope.bands` is no longer `None` in cached mode).
+* Train/eval mode switch and dtype change fixes for LeViT and related models (EfficentFormer*, EfficientViT-MSRA, TinyViT) w/ cached attention biases.
+
+## September 22, 2026
+
+* Add Qwen-Drive-1.0-4B vision tower weights.
+* Fix prefetch loader stream reuse/synchronization and AugMix for non-square and single-band images.
+* Fix AdaMuon conv LR scaling, AdafactorBigVision clipping, MARS gradient history, and Kron checkpoint loading.
+* Fix stale eval attention bias caches, pruned model feature metadata, dilated max-pool padding, and asymmetric loss gradient mode.
+* Release 1.0.30
+
+## September 10-11, 2026
+
+* Add Qwen3-VL / Qwen3.5 / Qwen3.8 ViT classifier and encoder variants, including classifiers w/ and w/o the native spatial merger.
+* Add Sapiens2 ViTs with EVA and NaFlexViT support. Both model additions include native timm Hub weights. Thanks [Yonghye Kwon](https://github.com/developer0hye).
+* Add iFormer with native timm Hub weights. Thanks [Ryan Hou](https://github.com/brianhou0208).
+* Add EfficientViM with native timm Hub weights. Thanks [smellslikeml](https://github.com/smellslikeml).
+* Add DeepSeek-V4 / V4.1 ViT classifiers and encoders with native timm Hub weights. Thanks [Yonghye Kwon](https://github.com/developer0hye).
+* Switch default NaFlex SigLIP position interpolation, `inference.py` input-size selection, and improve `--model-kwargs` parsing.
+* Fix meta-device construction and device/dtype factory support for a few models; move config tests to meta for faster CI, meta context coverage.
+
 ## August 27, 2026
 * Add [LowFormer](https://github.com/altair199797/lowformer) model and weights
 * Fix or merge a host of real but small or not commonly encountered bugs surfaced by agents
@@ -121,154 +227,6 @@
 ## Sept 21, 2025
 * Remap DINOv3 ViT weight tags from `lvd_1689m` -> `lvd1689m` to match (same for `sat_493m` -> `sat493m`)
 * Release 1.0.20
-
-## Sept 17, 2025
-* DINOv3 (https://arxiv.org/abs/2508.10104) ConvNeXt and ViT models added. ConvNeXt models were mapped to existing `timm` model. ViT support done via the EVA base model w/ a new `RotaryEmbeddingDinoV3` to match the DINOv3 specific RoPE impl
-  * HuggingFace Hub: https://huggingface.co/collections/timm/timm-dinov3-68cb08bb0bee365973d52a4d
-* MobileCLIP-2 (https://arxiv.org/abs/2508.20691) vision encoders. New MCI3/MCI4 FastViT variants added and weights mapped to existing FastViT and B, L/14 ViTs.
-* MetaCLIP-2 Worldwide (https://arxiv.org/abs/2507.22062) ViT encoder weights added.
-* SigLIP-2 (https://arxiv.org/abs/2502.14786) NaFlex ViT encoder weights added via timm NaFlexViT model.
-* Misc fixes and contributions
-
-## July 23, 2025
-* Add `set_input_size()` method to EVA models, used by OpenCLIP 3.0.0 to allow resizing for timm based encoder models.
-* Release 1.0.18, needed for PE-Core S & T models in OpenCLIP 3.0.0
-* Fix small typing issue that broke Python 3.9 compat. 1.0.19 patch release.
-
-## July 21, 2025
-* ROPE support added to NaFlexViT. All models covered by the EVA base (`eva.py`) including EVA, EVA02, Meta PE ViT, `timm` SBB ViT w/ ROPE, and Naver ROPE-ViT can be now loaded in NaFlexViT when `use_naflex=True` passed at model creation time
-* More Meta PE ViT encoders added, including small/tiny variants, lang variants w/ tiling, and more spatial variants.
-* PatchDropout fixed with NaFlexViT and also w/ EVA models (regression after adding Naver ROPE-ViT)
-* Fix XY order with grid_indexing='xy', impacted non-square image use in 'xy' mode (only ROPE-ViT and PE impacted).
-
-## July 7, 2025
-* MobileNet-v5 backbone tweaks for improved Google Gemma 3n behaviour (to pair with updated official weights)
-  * Add stem bias (zero'd in updated weights, compat break with old weights)
-  * GELU -> GELU (tanh approx). A minor change to be closer to JAX
-* Add two arguments to layer-decay support, a min scale clamp and 'no optimization' scale threshold
-* Add 'Fp32' LayerNorm, RMSNorm, SimpleNorm variants that can be enabled to force computation of norm in float32
-* Some typing, argument cleanup for norm, norm+act layers done with above
-* Support Naver ROPE-ViT (https://github.com/naver-ai/rope-vit) in `eva.py`, add RotaryEmbeddingMixed module for mixed mode, weights on HuggingFace Hub
-
-|model                                             |img_size|top1  |top5  |param_count|
-|--------------------------------------------------|--------|------|------|-----------|
-|vit_large_patch16_rope_mixed_ape_224.naver_in1k  |224     |84.84 |97.122|304.4      |
-|vit_large_patch16_rope_mixed_224.naver_in1k      |224     |84.828|97.116|304.2      |
-|vit_large_patch16_rope_ape_224.naver_in1k        |224     |84.65 |97.154|304.37     |
-|vit_large_patch16_rope_224.naver_in1k            |224     |84.648|97.122|304.17     |
-|vit_base_patch16_rope_mixed_ape_224.naver_in1k   |224     |83.894|96.754|86.59      |
-|vit_base_patch16_rope_mixed_224.naver_in1k       |224     |83.804|96.712|86.44      |
-|vit_base_patch16_rope_ape_224.naver_in1k         |224     |83.782|96.61 |86.59      |
-|vit_base_patch16_rope_224.naver_in1k             |224     |83.718|96.672|86.43      |
-|vit_small_patch16_rope_224.naver_in1k            |224     |81.23 |95.022|21.98      |
-|vit_small_patch16_rope_mixed_224.naver_in1k      |224     |81.216|95.022|21.99      |
-|vit_small_patch16_rope_ape_224.naver_in1k        |224     |81.004|95.016|22.06      |
-|vit_small_patch16_rope_mixed_ape_224.naver_in1k  |224     |80.986|94.976|22.06      |
-* Some cleanup of ROPE modules, helpers, and FX tracing leaf registration
-* Preparing version 1.0.17 release
-
-## June 26, 2025
-* MobileNetV5 backbone (w/ encoder only variant) for [Gemma 3n](https://ai.google.dev/gemma/docs/gemma-3n#parameters) image encoder
-* Version 1.0.16 released
-
-## June 23, 2025
-* Add F.grid_sample based 2D and factorized pos embed resize to NaFlexViT. Faster when lots of different sizes (based on example by https://github.com/stas-sl).
-* Further speed up patch embed resample by replacing vmap with matmul (based on snippet by https://github.com/stas-sl).
-* Add 3 initial native aspect NaFlexViT checkpoints created while testing, ImageNet-1k and 3 different pos embed configs w/ same hparams.
-
- | Model | Top-1 Acc | Top-5 Acc | Params (M) | Eval Seq Len |
- |:---|:---:|:---:|:---:|:---:|
- | [naflexvit_base_patch16_par_gap.e300_s576_in1k](https://hf.co/timm/naflexvit_base_patch16_par_gap.e300_s576_in1k) | 83.67 | 96.45 | 86.63 | 576 |
- | [naflexvit_base_patch16_parfac_gap.e300_s576_in1k](https://hf.co/timm/naflexvit_base_patch16_parfac_gap.e300_s576_in1k) | 83.63 | 96.41 | 86.46 | 576 |
- | [naflexvit_base_patch16_gap.e300_s576_in1k](https://hf.co/timm/naflexvit_base_patch16_gap.e300_s576_in1k) | 83.50 | 96.46 | 86.63 | 576 |
-* Support gradient checkpointing for `forward_intermediates` and fix some checkpointing bugs. Thanks https://github.com/brianhou0208
-* Add 'corrected weight decay' (https://arxiv.org/abs/2506.02285) as option to AdamW (legacy), Adopt, Kron, Adafactor (BV), Lamb, LaProp, Lion, NadamW, RmsPropTF, SGDW optimizers
-* Switch PE (perception encoder) ViT models to use native timm weights instead of remapping on the fly
-* Fix cuda stream bug in prefetch loader
-  
-## June 5, 2025
-* Initial NaFlexVit model code. NaFlexVit is a Vision Transformer with:
-  1. Encapsulated embedding and position encoding in a single module
-  2. Support for nn.Linear patch embedding on pre-patchified (dictionary) inputs
-  3. Support for NaFlex variable aspect, variable resolution (SigLip-2: https://arxiv.org/abs/2502.14786)
-  4. Support for FlexiViT variable patch size (https://arxiv.org/abs/2212.08013)
-  5. Support for NaViT fractional/factorized position embedding (https://arxiv.org/abs/2307.06304)
-* Existing vit models in `vision_transformer.py` can be loaded into the NaFlexVit model by adding the `use_naflex=True` flag to `create_model`
-  * Some native weights coming soon
-* A full NaFlex data pipeline is available that allows training / fine-tuning / evaluating with variable aspect / size images
-  * To enable in `train.py` and `validate.py` add the `--naflex-loader` arg, must be used with a NaFlexVit
-* To evaluate an existing (classic) ViT loaded in NaFlexVit model w/ NaFlex data pipe:
-  * `python validate.py /imagenet --amp -j 8 --model vit_base_patch16_224 --model-kwargs use_naflex=True --naflex-loader --naflex-max-seq-len 256` 
-* The training has some extra args features worth noting
-  * The `--naflex-train-seq-lens'` argument specifies which sequence lengths to randomly pick from per batch during training
-  * The `--naflex-max-seq-len` argument sets the target sequence length for validation
-  * Adding `--model-kwargs enable_patch_interpolator=True --naflex-patch-sizes 12 16 24` will enable random patch size selection per-batch w/ interpolation
-  * The `--naflex-loss-scale` arg changes loss scaling mode per batch relative to the batch size, `timm` NaFlex loading changes the batch size for each seq len
-
-## May 28, 2025
-* Add a number of small/fast models thanks to https://github.com/brianhou0208
-  * SwiftFormer - [(ICCV2023) SwiftFormer: Efficient Additive Attention for Transformer-based Real-time Mobile Vision Applications](https://github.com/Amshaker/SwiftFormer) 
-  * FasterNet - [(CVPR2023) Run, Don’t Walk: Chasing Higher FLOPS for Faster Neural Networks](https://github.com/JierunChen/FasterNet)
-  * SHViT - [(CVPR2024) SHViT: Single-Head Vision Transformer with Memory Efficient](https://github.com/ysj9909/SHViT)
-  * StarNet - [(CVPR2024) Rewrite the Stars](https://github.com/ma-xu/Rewrite-the-Stars)
-  * GhostNet-V3 [GhostNetV3: Exploring the Training Strategies for Compact Models](https://github.com/huawei-noah/Efficient-AI-Backbones/tree/master/ghostnetv3_pytorch)
-* Update EVA ViT (closest match) to support Perception Encoder models (https://arxiv.org/abs/2504.13181) from Meta, loading Hub weights but I still need to push dedicated `timm` weights
-  * Add some flexibility to ROPE impl
-* Big increase in number of models supporting `forward_intermediates()` and some additional fixes thanks to https://github.com/brianhou0208
-  * DaViT, EdgeNeXt, EfficientFormerV2, EfficientViT(MIT), EfficientViT(MSRA), FocalNet, GCViT, HGNet /V2, InceptionNeXt, Inception-V4, MambaOut, MetaFormer, NesT, Next-ViT, PiT, PVT V2, RepGhostNet, RepViT, ResNetV2, ReXNet, TinyViT, TResNet, VoV
-* TNT model updated w/ new weights `forward_intermediates()` thanks to https://github.com/brianhou0208
-* Add `local-dir:` pretrained schema, can use `local-dir:/path/to/model/folder` for model name to source model / pretrained cfg & weights Hugging Face Hub models (config.json + weights file) from a local folder.
-* Fixes, improvements for onnx export
-    
-## Feb 21, 2025
-* SigLIP 2 ViT image encoders added (https://huggingface.co/collections/timm/siglip-2-67b8e72ba08b09dd97aecaf9)
-  * Variable resolution / aspect NaFlex versions are a WIP
-* Add 'SO150M2' ViT weights trained with SBB recipes, great results, better for ImageNet than previous attempt w/ less training.
-  * `vit_so150m2_patch16_reg1_gap_448.sbb_e200_in12k_ft_in1k` - 88.1% top-1
-  * `vit_so150m2_patch16_reg1_gap_384.sbb_e200_in12k_ft_in1k` - 87.9% top-1
-  * `vit_so150m2_patch16_reg1_gap_256.sbb_e200_in12k_ft_in1k` - 87.3% top-1
-  * `vit_so150m2_patch16_reg4_gap_256.sbb_e200_in12k`
-* Updated InternViT-300M '2.5' weights
-* Release 1.0.15
-
-## Feb 1, 2025
-* FYI PyTorch 2.6 & Python 3.13 are tested and working w/ current main and released version of `timm`
-
-## Jan 27, 2025
-* Add Kron Optimizer (PSGD w/ Kronecker-factored preconditioner) 
-  * Code from https://github.com/evanatyourservice/kron_torch
-  * See also https://sites.google.com/site/lixilinx/home/psgd
-
-## Jan 19, 2025
-* Fix loading of LeViT safetensor weights, remove conversion code which should have been deactivated
-* Add 'SO150M' ViT weights trained with SBB recipes, decent results, but not optimal shape for ImageNet-12k/1k pretrain/ft
-  * `vit_so150m_patch16_reg4_gap_256.sbb_e250_in12k_ft_in1k` - 86.7% top-1
-  * `vit_so150m_patch16_reg4_gap_384.sbb_e250_in12k_ft_in1k` - 87.4% top-1
-  * `vit_so150m_patch16_reg4_gap_256.sbb_e250_in12k`
-* Misc typing, typo, etc. cleanup
-* 1.0.14 release to get above LeViT fix out
-
-## Jan 9, 2025
-* Add support to train and validate in pure `bfloat16` or `float16`
-* `wandb` project name arg added by https://github.com/caojiaolong, use arg.experiment for name
-* Fix old issue w/ checkpoint saving not working on filesystem w/o hard-link support (e.g. FUSE fs mounts)
-* 1.0.13 release
-
-## Jan 6, 2025
-* Add `torch.utils.checkpoint.checkpoint()` wrapper in `timm.models` that defaults `use_reentrant=False`, unless `TIMM_REENTRANT_CKPT=1` is set in env.
-
-## Dec 31, 2024
-* `convnext_nano` 384x384 ImageNet-12k pretrain & fine-tune. https://huggingface.co/models?search=convnext_nano%20r384
-* Add AIM-v2 encoders from https://github.com/apple/ml-aim, see on Hub: https://huggingface.co/models?search=timm%20aimv2
-* Add PaliGemma2 encoders from https://github.com/google-research/big_vision to existing PaliGemma, see on Hub: https://huggingface.co/models?search=timm%20pali2
-* Add missing L/14 DFN2B 39B CLIP ViT, `vit_large_patch14_clip_224.dfn2b_s39b`
-* Fix existing `RmsNorm` layer & fn to match standard formulation, use PT 2.5 impl when possible. Move old impl to `SimpleNorm` layer, it's LN w/o centering or bias. There were only two `timm` models using it, and they have been updated.
-* Allow override of `cache_dir` arg for model creation
-* Pass through `trust_remote_code` for HF datasets wrapper
-* `inception_next_atto` model added by creator
-* Adan optimizer caution, and Lamb decoupled weight decay options
-* Some feature_info metadata fixed by https://github.com/brianhou0208
-* All OpenCLIP and JAX (CLIP, SigLIP, Pali, etc) model weights that used load time remapping were given their own HF Hub instances so that they work with `hf-hub:` based loading, and thus will work with new Transformers `TimmWrapperModel`
 
 ## Introduction
 

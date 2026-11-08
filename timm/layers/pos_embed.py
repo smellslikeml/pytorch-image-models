@@ -10,6 +10,7 @@ import torch
 import torch.nn.functional as F
 
 from ._fx import register_notrace_function
+from .helpers import is_exporting
 
 _logger = logging.getLogger(__name__)
 
@@ -24,11 +25,13 @@ def resample_abs_pos_embed(
         interpolation: str = 'bicubic',
         antialias: bool = True,
         verbose: bool = False,
+        align_corners: Optional[bool] = None,
 ):
     # sort out sizes, assume square if old size not provided
     num_pos_tokens = posemb.shape[1]
     num_new_tokens = new_size[0] * new_size[1] + num_prefix_tokens
-    if num_new_tokens == num_pos_tokens:
+    # skip size-match early-outs when exporting, they'd specialize the graph to the example input size
+    if not is_exporting() and num_new_tokens == num_pos_tokens:
         if old_size is not None and old_size[0] == new_size[0] and old_size[1] == new_size[1]:
             return posemb
         if old_size is None and new_size[0] == new_size[1]:
@@ -48,7 +51,7 @@ def resample_abs_pos_embed(
     orig_dtype = posemb.dtype
     posemb = posemb.float()  # interpolate needs float32
     posemb = posemb.reshape(1, old_size[0], old_size[1], -1).permute(0, 3, 1, 2)
-    posemb = F.interpolate(posemb, size=new_size, mode=interpolation, antialias=antialias)
+    posemb = F.interpolate(posemb, size=new_size, mode=interpolation, align_corners=align_corners, antialias=antialias)
     posemb = posemb.permute(0, 2, 3, 1).reshape(1, -1, embed_dim)
     posemb = posemb.to(orig_dtype)
 
@@ -71,7 +74,7 @@ def resample_abs_pos_embed_nhwc(
         antialias: bool = True,
         verbose: bool = False,
 ):
-    if new_size[0] == posemb.shape[-3] and new_size[1] == posemb.shape[-2]:
+    if not is_exporting() and new_size[0] == posemb.shape[-3] and new_size[1] == posemb.shape[-2]:
         return posemb
 
     orig_dtype = posemb.dtype

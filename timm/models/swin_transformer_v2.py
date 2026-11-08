@@ -1,6 +1,6 @@
 """ Swin Transformer V2
-A PyTorch impl of : `Swin Transformer V2: Scaling Up Capacity and Resolution`
-    - https://arxiv.org/abs/2111.09883
+A PyTorch impl of :
+    * `Swin Transformer V2: Scaling Up Capacity and Resolution` - https://arxiv.org/abs/2111.09883
 
 Code/weights from https://github.com/microsoft/Swin-Transformer, original copyright/license info below
 
@@ -14,7 +14,7 @@ Modifications and additions for timm hacked together by / Copyright 2022, Ross W
 # --------------------------------------------------------
 import math
 from functools import partial
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Type, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, Type, Union
 
 import torch
 import torch.nn as nn
@@ -23,11 +23,13 @@ import torch.nn.functional as F
 from timm.data import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
 from timm.layers import PatchEmbed, Mlp, DropPath, calculate_drop_path_rates, to_2tuple, trunc_normal_, ClassifierHead,\
     resample_patch_embed, ndgrid, get_act_layer, LayerType, get_device_dtype
+from ._input import update_model_input_size
 from ._builder import build_model_with_cfg
 from ._features import feature_take_indices
 from ._features_fx import register_notrace_function
 from ._manipulate import checkpoint
 from ._registry import generate_default_cfgs, register_model, register_model_deprecations
+from .swin_transformer import calc_stage_window_sizes, resolve_stage_window_sizes, resolve_window_args
 
 __all__ = ['SwinTransformerV2']  # model_registry will add each entrypoint fn to this
 
@@ -190,12 +192,13 @@ class WindowAttention(nn.Module):
             -(self.window_size[1] - 1), self.window_size[1], device=device, dtype=torch.float32)
         relative_coords_table = torch.stack(ndgrid(relative_coords_h, relative_coords_w))
         relative_coords_table = relative_coords_table.permute(1, 2, 0).contiguous().unsqueeze(0)  # 1, 2*Wh-1, 2*Ww-1, 2
+        # NOTE max(.., 1) as a window size of 1 only has a relative coord of 0, avoid 0 / 0
         if self.pretrained_window_size[0] > 0:
-            relative_coords_table[:, :, :, 0] /= (self.pretrained_window_size[0] - 1)
-            relative_coords_table[:, :, :, 1] /= (self.pretrained_window_size[1] - 1)
+            relative_coords_table[:, :, :, 0] /= max(self.pretrained_window_size[0] - 1, 1)
+            relative_coords_table[:, :, :, 1] /= max(self.pretrained_window_size[1] - 1, 1)
         else:
-            relative_coords_table[:, :, :, 0] /= (self.window_size[0] - 1)
-            relative_coords_table[:, :, :, 1] /= (self.window_size[1] - 1)
+            relative_coords_table[:, :, :, 0] /= max(self.window_size[0] - 1, 1)
+            relative_coords_table[:, :, :, 1] /= max(self.window_size[1] - 1, 1)
         relative_coords_table *= 8  # normalize to -8, 8
         relative_coords_table = torch.sign(relative_coords_table) * torch.log2(
             torch.abs(relative_coords_table) + 1.0) / math.log2(8)
@@ -368,11 +371,21 @@ class SwinTransformerV2Block(nn.Module):
         self.norm2 = norm_layer(dim, **dd)
         self.drop_path2 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
 
-        self.register_buffer(
-            "attn_mask",
-            None if self.dynamic_mask else self.get_attn_mask(**dd),
-            persistent=False,
-        )
+        # Register buffer as None initially, computed in _init_buffers if needed
+        self.register_buffer("attn_mask", None, persistent=False)
+        self._init_buffers()
+
+    def _init_buffers(self) -> None:
+        """Compute and fill non-persistent buffer values."""
+        if not self.dynamic_mask:
+            device = self.norm1.weight.device
+            dtype = self.norm1.weight.dtype
+            attn_mask = self.get_attn_mask(device=device, dtype=dtype)
+            self.register_buffer("attn_mask", attn_mask, persistent=False)
+
+    def init_non_persistent_buffers(self) -> None:
+        """Initialize non-persistent buffers."""
+        self._init_buffers()
 
     def get_attn_mask(
             self,
@@ -390,10 +403,17 @@ class SwinTransformerV2Block(nn.Module):
         """
         if any(self.shift_size):
             # calculate attention mask for SW-MSA
-            if x is None:
-                img_mask = torch.zeros((1, *self.input_resolution, 1), device=device, dtype=dtype)  # 1 H W 1
+            if x is not None:
+                H, W = x.shape[1], x.shape[2]
+                device = x.device
+                dtype = x.dtype
             else:
-                img_mask = torch.zeros((1, x.shape[1], x.shape[2], 1), device=x.device, dtype=x.dtype)  # 1 H W 1
+                # static mask must cover the padded (window multiple) size used in _attn, a dynamic mask is
+                # created from the already padded x (no python rounding, keeps the size traceable)
+                H, W = self.input_resolution
+                H = math.ceil(H / self.window_size[0]) * self.window_size[0]
+                W = math.ceil(W / self.window_size[1]) * self.window_size[1]
+            img_mask = torch.zeros((1, H, W, 1), device=device, dtype=dtype)  # 1 H W 1
             cnt = 0
             for h in (
                     (0, -self.window_size[0]),
@@ -468,13 +488,7 @@ class SwinTransformerV2Block(nn.Module):
         self.window_size, self.shift_size = self._calc_window_shift(to_2tuple(window_size))
         self.window_area = self.window_size[0] * self.window_size[1]
         self.attn.set_window_size(self.window_size)
-        device = self.attn_mask.device if self.attn_mask is not None else None
-        dtype = self.attn_mask.dtype if self.attn_mask is not None else None
-        self.register_buffer(
-            "attn_mask",
-            None if self.dynamic_mask else self.get_attn_mask(device=device, dtype=dtype),
-            persistent=False,
-        )
+        self._init_buffers()
 
     def _attn(self, x: torch.Tensor) -> torch.Tensor:
         """Apply windowed attention with optional shift.
@@ -627,7 +641,7 @@ class SwinTransformerV2Stage(nn.Module):
         super().__init__()
         self.dim = dim
         self.input_resolution = input_resolution
-        self.output_resolution = tuple(i // 2 for i in input_resolution) if downsample else input_resolution
+        self.output_resolution = tuple((i + 1) // 2 for i in input_resolution) if downsample else input_resolution
         self.depth = depth
         self.output_nchw = output_nchw
         self.grad_checkpointing = False
@@ -681,7 +695,7 @@ class SwinTransformerV2Stage(nn.Module):
             self.output_resolution = feat_size
         else:
             assert isinstance(self.downsample, PatchMerging)
-            self.output_resolution = tuple(i // 2 for i in feat_size)
+            self.output_resolution = tuple((i + 1) // 2 for i in feat_size)
         for block in self.blocks:
             block.set_input_size(
                 feat_size=self.output_resolution,
@@ -736,9 +750,10 @@ class SwinTransformerV2(nn.Module):
             embed_dim: int = 96,
             depths: Tuple[int, ...] = (2, 2, 6, 2),
             num_heads: Tuple[int, ...] = (3, 6, 12, 24),
-            window_size: _int_or_tuple_2_t = 7,
+            window_size: Union[_int_or_tuple_2_t, Sequence[_int_or_tuple_2_t]] = 7,
             always_partition: bool = False,
             strict_img_size: bool = True,
+            dynamic_img_size: bool = False,
             mlp_ratio: float = 4.,
             qkv_bias: bool = True,
             drop_rate: float = 0.,
@@ -750,7 +765,6 @@ class SwinTransformerV2(nn.Module):
             pretrained_window_sizes: Tuple[int, ...] = (0, 0, 0, 0),
             device=None,
             dtype=None,
-            **kwargs,
     ):
         """
         Args:
@@ -761,7 +775,11 @@ class SwinTransformerV2(nn.Module):
             embed_dim: Patch embedding dimension.
             depths: Depth of each Swin Transformer stage (layer).
             num_heads: Number of attention heads in different layers.
-            window_size: Window size.
+            window_size: Window size, a single value for all stages or one per stage.
+            always_partition: Always partition into windows and shift (even if window size < feat size).
+            strict_img_size: Require the input to match img_size.
+            dynamic_img_size: Accept any input size, building the attention masks for it on each forward. Same as
+                strict_img_size=False.
             mlp_ratio: Ratio of mlp hidden dim to embedding dim.
             qkv_bias: If True, add a learnable bias to query, key, value.
             drop_rate: Head dropout rate.
@@ -776,15 +794,17 @@ class SwinTransformerV2(nn.Module):
         """
         super().__init__()
         dd = {'device': device, 'dtype': dtype}
+        if dynamic_img_size:
+            strict_img_size = False
+        self.dynamic_img_size = not strict_img_size
 
         self.num_classes = num_classes
         self.in_chans = in_chans
-        assert global_pool in ('', 'avg')
         self.global_pool = global_pool
         self.output_fmt = 'NHWC'
         self.num_layers = len(depths)
         self.embed_dim = embed_dim
-        self.num_features = self.head_hidden_size = int(embed_dim * 2 ** (self.num_layers - 1))
+        self.num_features = int(embed_dim * 2 ** (self.num_layers - 1))
         self.feature_info = []
 
         if not isinstance(embed_dim, (tuple, list)):
@@ -802,6 +822,10 @@ class SwinTransformerV2(nn.Module):
             **dd,
         )
         grid_size = self.patch_embed.grid_size
+        window_size = resolve_stage_window_sizes(window_size, self.num_layers)
+        # set_input_size() scales these with the patch grid to keep each stage's window to grid ratio
+        self._ref_window_sizes = window_size
+        self._ref_grid_size = tuple(grid_size)
 
         dpr = calculate_drop_path_rates(drop_path_rate, depths, stagewise=True)
         layers = []
@@ -812,11 +836,11 @@ class SwinTransformerV2(nn.Module):
             layers += [SwinTransformerV2Stage(
                 dim=in_dim,
                 out_dim=out_dim,
-                input_resolution=(grid_size[0] // scale, grid_size[1] // scale),
+                input_resolution=tuple((g + scale - 1) // scale for g in grid_size),
                 depth=depths[i],
                 downsample=i > 0,
                 num_heads=num_heads[i],
-                window_size=window_size,
+                window_size=window_size[i],
                 always_partition=always_partition,
                 dynamic_mask=not strict_img_size,
                 mlp_ratio=mlp_ratio,
@@ -832,7 +856,8 @@ class SwinTransformerV2(nn.Module):
             in_dim = out_dim
             if i > 0:
                 scale *= 2
-            self.feature_info += [dict(num_chs=out_dim, reduction=4 * scale, module=f'layers.{i}')]
+            self.feature_info += [dict(
+                num_chs=out_dim, reduction=max(to_2tuple(patch_size)) * scale, module=f'layers.{i}')]
 
         self.layers = nn.Sequential(*layers)
         self.norm = norm_layer(self.num_features, **dd)
@@ -844,6 +869,7 @@ class SwinTransformerV2(nn.Module):
             input_fmt=self.output_fmt,
             **dd,
         )
+        self.head_hidden_size = self.head.num_features
 
         # TODO: skip init when on meta device when safe to do so
         self.init_weights(needs_reset=False)
@@ -877,33 +903,60 @@ class SwinTransformerV2(nn.Module):
             self,
             img_size: Optional[Tuple[int, int]] = None,
             patch_size: Optional[Tuple[int, int]] = None,
-            window_size: Optional[Tuple[int, int]] = None,
-            window_ratio: Optional[int] = 8,
+            window_size: Optional[Union[_int_or_tuple_2_t, Sequence[_int_or_tuple_2_t]]] = None,
+            window_ratio: Optional[Union[int, Sequence[int]]] = None,
             always_partition: Optional[bool] = None,
     ):
         """Updates the image resolution, window size, and so the pair-wise relative positions.
 
+        If neither window_size nor window_ratio is set, each stage's window size is scaled with the patch grid
+        so the window to grid ratio of every stage is kept, calling at the current size is a no-op.
+
         Args:
             img_size (Optional[Tuple[int, int]]): New input resolution, if None current resolution is used
-            patch_size (Optional[Tuple[int, int]): New patch size, if None use current patch size
-            window_size (Optional[int]): New window size, if None based on new_img_size // window_div
-            window_ratio (int): divisor for calculating window size from patch grid size
+            patch_size (Optional[Tuple[int, int]]): New patch size, if None use current patch size
+            window_size: New window size, an int or (h, w) for all stages or one per stage. Overrides window_ratio.
+            window_ratio: Divisor of the new patch grid size (before stage downsampling), an int for all stages
+                or one per stage. Unlike window_size, a sequence of two values is two stages, not (h, w).
             always_partition: always partition / shift windows even if feat size is < window
         """
+        # check and expand window args first so an invalid spec cannot leave the model partially updated
+        window_size, window_ratio = resolve_window_args(window_size, window_ratio, len(self.layers))
         if img_size is not None or patch_size is not None:
             self.patch_embed.set_input_size(img_size=img_size, patch_size=patch_size)
-            grid_size = self.patch_embed.grid_size
+        if patch_size is not None:
+            for index, info in enumerate(self.feature_info):
+                info['reduction'] = max(self.patch_embed.patch_size) * 2 ** index
+        grid_size = tuple(self.patch_embed.grid_size)
 
-        if window_size is None and window_ratio is not None:
-            window_size = tuple([s // window_ratio for s in grid_size])
+        window_sizes = calc_stage_window_sizes(
+            grid_size,
+            self._ref_window_sizes,
+            self._ref_grid_size,
+            window_size=window_size,
+            window_ratio=window_ratio,
+        )
+        if window_size is not None or window_ratio is not None:
+            # explicit window sizes become the new reference for later resizes
+            self._ref_window_sizes = window_sizes
+            self._ref_grid_size = grid_size
 
         for index, stage in enumerate(self.layers):
             stage_scale = 2 ** max(index - 1, 0)
             stage.set_input_size(
-                feat_size=(grid_size[0] // stage_scale, grid_size[1] // stage_scale),
-                window_size=window_size,
+                feat_size=tuple((g + stage_scale - 1) // stage_scale for g in grid_size),
+                window_size=window_sizes[index],
                 always_partition=always_partition,
             )
+
+        # record the per-stage windows in use, a model rebuilt w/ img_size alone would use the constructor windows
+        update_model_input_size(
+            self,
+            self.patch_embed.img_size,
+            patch_size=patch_size,
+            window_size=window_sizes,
+            always_partition=always_partition,
+        )
 
     @torch.jit.ignore
     def no_weight_decay(self) -> Set[str]:
@@ -913,7 +966,7 @@ class SwinTransformerV2(nn.Module):
             Set of parameter names to exclude from weight decay.
         """
         nod = set()
-        for n, m in self.named_modules():
+        for n, _ in self.named_parameters():
             if any([kw in n for kw in ("cpb_mlp", "logit_scale")]):
                 nod.add(n)
         return nod
@@ -965,7 +1018,10 @@ class SwinTransformerV2(nn.Module):
         """
         dd = get_device_dtype(self)
         self.num_classes = num_classes
-        self.head.reset(num_classes, global_pool, **dd)
+        self.head.reset(num_classes, global_pool, in_features=self.num_features, **dd)
+        self.head_hidden_size = self.head.num_features
+        if global_pool is not None:
+            self.global_pool = global_pool  # kept in sync w/ the head, which does the pooling
 
     def forward_intermediates(
             self,
@@ -1000,6 +1056,7 @@ class SwinTransformerV2(nn.Module):
             stages = self.layers
         else:
             stages = self.layers[:max_index + 1]
+        i = 0
         for i, stage in enumerate(stages):
             x = stage(x)
             if i in take_indices:
@@ -1013,7 +1070,8 @@ class SwinTransformerV2(nn.Module):
         if intermediates_only:
             return intermediates
 
-        x = self.norm(x)
+        if i == num_stages - 1:
+            x = self.norm(x)  # final norm is sized for (and only applied to) the last stage
 
         return x, intermediates
 
@@ -1026,10 +1084,15 @@ class SwinTransformerV2(nn.Module):
         """ Prune layers not required for specified intermediates.
         """
         take_indices, max_index = feature_take_indices(len(self.layers), indices)
+        prune_end = max_index < len(self.layers) - 1
+        if prune_norm or prune_end:
+            self.norm = nn.Identity()  # final norm is sized for (and only applied to) the last stage
         self.layers = self.layers[:max_index + 1]  # truncate blocks
-        if prune_norm:
-            self.norm = nn.Identity()
-        if prune_head:
+        self._ref_window_sizes = self._ref_window_sizes[:max_index + 1]
+        if prune_end:
+            # features now end at the last kept tap, the head is sized for the final features so it goes too
+            self.num_features = self.head_hidden_size = self.feature_info[max_index]['num_chs']
+        if prune_head or prune_end:
             self.reset_classifier(0, '')
         return take_indices
 
@@ -1088,7 +1151,9 @@ def checkpoint_filter_fn(state_dict: Dict[str, torch.Tensor], model: nn.Module) 
     """
     state_dict = state_dict.get('model', state_dict)
     state_dict = state_dict.get('state_dict', state_dict)
-    native_checkpoint = 'head.fc.weight' in state_dict
+    # original checkpoints downsample at the end of a stage (stage 0 has one), timm at the start (stage 0 has none),
+    # the classifier can't be used to tell them apart, it is absent in headless checkpoints
+    native_checkpoint = 'layers.0.downsample.reduction.weight' not in state_dict
     out_dict = {}
     import re
     for k, v in state_dict.items():

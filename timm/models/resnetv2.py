@@ -9,9 +9,12 @@ extra padding support to allow porting of official Hybrid ResNet pretrained weig
 https://github.com/google-research/vision_transformer
 
 Thanks to the Google team for the above two repositories and associated papers:
-* Big Transfer (BiT): General Visual Representation Learning - https://arxiv.org/abs/1912.11370
-* An Image is Worth 16x16 Words: Transformers for Image Recognition at Scale - https://arxiv.org/abs/2010.11929
-* Knowledge distillation: A good teacher is patient and consistent - https://arxiv.org/abs/2106.05237
+* `Big Transfer (BiT): General Visual Representation Learning` - https://arxiv.org/abs/1912.11370
+* `An Image is Worth 16x16 Words: Transformers for Image Recognition at Scale` - https://arxiv.org/abs/2010.11929
+* `Knowledge distillation: A good teacher is patient and consistent` - https://arxiv.org/abs/2106.05237
+
+Other papers:
+* `Identity Mappings in Deep Residual Networks` - https://arxiv.org/abs/1603.05027
 
 Original copyright of Google code below, modifications by Ross Wightman, Copyright 2020.
 """
@@ -587,8 +590,11 @@ class ResNetV2(nn.Module):
             norm_layer=norm_layer,
             **dd,
         )
-        stem_feat = ('stem.conv3' if is_stem_deep(stem_type) else 'stem.conv') if preact else 'stem.norm'
-        self.feature_info.append(dict(num_chs=stem_chs, reduction=2, module=stem_feat))
+        # the stem feature is the stride 2 conv (preact) or norm output, before the stem pooling
+        stem_feat = ('conv3' if is_stem_deep(stem_type) else 'conv') if preact else (
+            'norm3' if is_stem_deep(stem_type) else 'norm')
+        self.stem_feat_idx = [n for n, _ in self.stem.named_children()].index(stem_feat)
+        self.feature_info.append(dict(num_chs=stem_chs, reduction=2, module=f'stem.{stem_feat}'))
 
         prev_chs = stem_chs
         curr_stride = 4
@@ -626,7 +632,7 @@ class ResNetV2(nn.Module):
             self.feature_info += [dict(num_chs=prev_chs, reduction=curr_stride, module=f'stages.{stage_idx}')]
             self.stages.add_module(str(stage_idx), stage)
 
-        self.num_features = self.head_hidden_size = prev_chs
+        self.num_features = prev_chs
         self.norm = norm_layer(self.num_features, **dd) if preact else nn.Identity()
         self.head = ClassifierHead(
             self.num_features,
@@ -636,6 +642,7 @@ class ResNetV2(nn.Module):
             use_conv=True,
             **dd,
         )
+        self.head_hidden_size = self.head.num_features
 
         self.init_weights(zero_init_last=zero_init_last)
 
@@ -685,7 +692,8 @@ class ResNetV2(nn.Module):
         """
         dd = get_device_dtype(self)
         self.num_classes = num_classes
-        self.head.reset(num_classes, global_pool, **dd)
+        self.head.reset(num_classes, global_pool, in_features=self.num_features, **dd)
+        self.head_hidden_size = self.head.num_features
 
     def forward_intermediates(
             self,
@@ -714,10 +722,10 @@ class ResNetV2(nn.Module):
 
         # forward pass
         feat_idx = 0
-        H, W = x.shape[-2:]
-        for stem in self.stem:
+        x_down = x
+        for i, stem in enumerate(self.stem):
             x = stem(x)
-            if x.shape[-2:] == (H //2, W //2):
+            if i == self.stem_feat_idx:
                 x_down = x
         if feat_idx in take_indices:
             intermediates.append(x_down)
@@ -753,10 +761,16 @@ class ResNetV2(nn.Module):
         """ Prune layers not required for specified intermediates.
         """
         take_indices, max_index = feature_take_indices(5, indices)
+        prune_end = max_index < len(self.stages)
+        if prune_norm or prune_end:
+            self.norm = nn.Identity()  # final norm is sized for (and only applied to) the last stage
         self.stages = self.stages[:max_index]  # truncate blocks w/ stem as idx 0
-        if prune_norm:
-            self.norm = nn.Identity()
-        if prune_head:
+        if max_index == 0:
+            self.stem = self.stem[:self.stem_feat_idx + 1]  # stem feature is taken before the stem pooling
+        if prune_end:
+            # features now end at the last kept tap, the head is sized for the final features so it goes too
+            self.num_features = self.head_hidden_size = self.feature_info[max_index]['num_chs']
+        if prune_head or prune_end:
             self.reset_classifier(0, '')
         return take_indices
 

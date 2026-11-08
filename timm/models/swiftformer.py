@@ -1,7 +1,8 @@
 """SwiftFormer
 SwiftFormer: Efficient Additive Attention for Transformer-based Real-time Mobile Vision Applications
 Code: https://github.com/Amshaker/SwiftFormer
-Paper: https://arxiv.org/pdf/2303.15446
+Paper:
+* `SwiftFormer: Efficient Additive Attention for Transformer-based Real-time Mobile Vision Applications` - https://arxiv.org/abs/2303.15446
 
 @InProceedings{Shaker_2023_ICCV,
     author    = {Shaker, Abdelrahman and Maaz, Muhammad and Rasheed, Hanoona and Khan, Salman and Yang, Ming-Hsuan and Khan, Fahad Shahbaz},
@@ -354,21 +355,24 @@ class SwiftFormer(nn.Module):
             down_pad: int = 1,
             num_classes: int = 1000,
             drop_rate: float = 0.,
+            proj_drop_rate: float = 0.,
             drop_path_rate: float = 0.,
             use_layer_scale: bool = True,
             layer_scale_init_value: float = 1e-5,
             global_pool: str = 'avg',
             output_stride: int = 32,
             in_chans: int = 3,
+            img_size: Optional[Union[int, Tuple[int, int]]] = None,
             device=None,
             dtype=None,
-            **kwargs,
     ):
         super().__init__()
         dd = {'device': device, 'dtype': dtype}
+        # img_size is unused, accepted as the builder passes it for fixed_input_size models.
         assert output_stride == 32
         self.num_classes = num_classes
         self.in_chans = in_chans
+        assert global_pool in ('', 'avg'), 'Only avg pooling (or none) is supported.'
         self.global_pool = global_pool
         self.feature_info = []
 
@@ -398,7 +402,7 @@ class SwiftFormer(nn.Module):
                 layers=layers,
                 mlp_ratio=mlp_ratios,
                 act_layer=act_layer,
-                drop_rate=drop_rate,
+                drop_rate=proj_drop_rate,
                 drop_path_rate=drop_path_rate,
                 use_layer_scale=use_layer_scale,
                 layer_scale_init_value=layer_scale_init_value,
@@ -460,6 +464,7 @@ class SwiftFormer(nn.Module):
         dd = get_device_dtype(self)
         self.num_classes = num_classes
         if global_pool is not None:
+            assert global_pool in ('', 'avg'), 'Only avg pooling (or none) is supported.'
             self.global_pool = global_pool
         self.head = Linear(self.num_features, num_classes, **dd) if num_classes > 0 else nn.Identity()
         self.head.train(self.training)
@@ -529,10 +534,14 @@ class SwiftFormer(nn.Module):
         """ Prune layers not required for specified intermediates.
         """
         take_indices, max_index = feature_take_indices(len(self.stages), indices)
+        prune_end = max_index < len(self.stages) - 1
+        if prune_norm or prune_end:
+            self.norm = nn.Identity()  # final norm is sized for (and only applied to) the last stage
         self.stages = self.stages[:max_index + 1]  # truncate blocks w/ stem as idx 0
-        if prune_norm:
-            self.norm = nn.Identity()
-        if prune_head:
+        if prune_end:
+            # features now end at the last kept tap, the head is sized for the final features so it goes too
+            self.num_features = self.head_hidden_size = self.feature_info[max_index]['num_chs']
+        if prune_head or prune_end:
             self.reset_classifier(0, '')
         return take_indices
 

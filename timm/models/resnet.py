@@ -5,6 +5,21 @@ additional dropout and dynamic global avg/max pool.
 
 ResNeXt, SE-ResNeXt, SENet, and MXNet Gluon stem/downsample variants, tiered stems added by Ross Wightman
 
+Papers:
+* `Deep Residual Learning for Image Recognition` - https://arxiv.org/abs/1512.03385
+* `Bag of Tricks for Image Classification with Convolutional Neural Networks` - https://arxiv.org/abs/1812.01187
+* `Aggregated Residual Transformations for Deep Neural Networks` - https://arxiv.org/abs/1611.05431
+* `Wide Residual Networks` - https://arxiv.org/abs/1605.07146
+* `Squeeze-and-Excitation Networks` - https://arxiv.org/abs/1709.01507
+* `ECA-Net: Efficient Channel Attention for Deep Convolutional Neural Networks` - https://arxiv.org/abs/1910.03151
+* `Making Convolutional Networks Shift-Invariant Again` - https://arxiv.org/abs/1904.11486
+* `Group Normalization` - https://arxiv.org/abs/1803.08494
+* `Revisiting ResNets: Improved Training and Scaling Strategies` - https://arxiv.org/abs/2103.07579
+* `ResNet strikes back: An improved training procedure in timm` - https://arxiv.org/abs/2110.00476
+* `Billion-scale semi-supervised learning for image classification` - https://arxiv.org/abs/1905.00546
+* `Exploring the Limits of Weakly Supervised Pretraining` - https://arxiv.org/abs/1805.00932
+* `Knapsack Pruning with Inner Distillation` - https://arxiv.org/abs/2002.08258
+
 Copyright 2019, Ross Wightman
 """
 import math
@@ -602,8 +617,9 @@ class ResNet(nn.Module):
         self.feature_info.extend(stage_feature_info)
 
         # Head (Pooling and Classifier)
-        self.num_features = self.head_hidden_size = channels[-1] * block_fns[-1].expansion
+        self.num_features = channels[-1] * block_fns[-1].expansion
         self.global_pool, self.fc = create_classifier(self.num_features, self.num_classes, pool_type=global_pool, **dd)
+        self.head_hidden_size = self.num_features * self.global_pool.feat_mult()
 
         self.init_weights(zero_init_last=zero_init_last)
 
@@ -656,16 +672,19 @@ class ResNet(nn.Module):
         """
         return 'fc' if name_only else self.fc
 
-    def reset_classifier(self, num_classes: int, global_pool: str = 'avg') -> None:
+    def reset_classifier(self, num_classes: int, global_pool: Optional[str] = None) -> None:
         """Reset the classifier head.
 
         Args:
             num_classes: Number of classes for new classifier.
-            global_pool: Global pooling type.
+            global_pool: Global pooling type, current pooling is kept if None.
         """
         dd = get_device_dtype(self)
         self.num_classes = num_classes
+        if global_pool is None:
+            global_pool = self.global_pool.pool_type
         self.global_pool, self.fc = create_classifier(self.num_features, self.num_classes, pool_type=global_pool, **dd)
+        self.head_hidden_size = self.num_features * self.global_pool.feat_mult()
         self.global_pool.train(self.training)
         self.fc.train(self.training)
 
@@ -709,7 +728,11 @@ class ResNet(nn.Module):
             layer_names = layer_names[:max_index]
         for n in layer_names:
             feat_idx += 1
-            x = getattr(self, n)(x)  # won't work with torchscript, but keeps code reasonable, FML
+            layer = getattr(self, n)  # won't work with torchscript, but keeps code reasonable, FML
+            if self.grad_checkpointing and not torch.jit.is_scripting():
+                x = checkpoint_seq(layer, x)  # per block, as forward_features
+            else:
+                x = layer(x)
             if feat_idx in take_indices:
                 intermediates.append(x)
 
@@ -735,11 +758,17 @@ class ResNet(nn.Module):
             List of indices that were kept.
         """
         take_indices, max_index = feature_take_indices(5, indices)
+        prune_end = max_index < 4
         layer_names = ('layer1', 'layer2', 'layer3', 'layer4')
         layer_names = layer_names[max_index:]
         for n in layer_names:
-            setattr(self, n, nn.Identity())
-        if prune_head:
+            setattr(self, n, nn.Sequential())  # empty, not Identity, so (flattened) checkpoint_seq can iterate it
+        if max_index == 0:
+            self.maxpool = nn.Identity()  # follows the stem feature, may have params (conv pool)
+        if prune_end:
+            # features now end at the last kept tap, the head is sized for the final features so it goes too
+            self.num_features = self.head_hidden_size = self.feature_info[max_index]['num_chs']
+        if prune_head or prune_end:
             self.reset_classifier(0, '')
         return take_indices
 
@@ -1097,6 +1126,11 @@ default_cfgs = generate_default_cfgs({
     'resnext101_64x4d.c1_in1k': _rcfg(
         hf_hub_id='timm/',
         url='https://github.com/rwightman/pytorch-image-models/releases/download/v0.1-tpu-weights/resnext101_64x4d_c-0d0e0cc0.pth'),
+
+    # Bamboo-CLS backbone (no classifier), using the upstream benchmark preprocessing.
+    'resnet50.bamboo': _tcfg(
+        hf_hub_id='timm/', num_classes=0, crop_pct=1.0,
+        license=None, origin_url='https://github.com/ZhangYuanhan-AI/Bamboo', paper_ids='arXiv:2203.07845'),
 
     # torchvision ResNeXt weights
     'resnext50_32x4d.tv_in1k': _cfg(
@@ -1867,11 +1901,11 @@ def ecaresnext26t_32x4d(pretrained: bool = False, **kwargs) -> ResNet:
 @register_model
 def ecaresnext50t_32x4d(pretrained: bool = False, **kwargs) -> ResNet:
     """Constructs an ECA-ResNeXt-50-T model.
-    This is technically a 28 layer ResNet, like a 'D' bag-of-tricks model but with tiered 24, 32, 64 channels
-    in the deep stem. This model replaces SE module with the ECA module
+    Like a 'D' bag-of-tricks model but with tiered 24, 32, 64 channels in the deep stem.
+    This model replaces SE module with the ECA module
     """
     model_args = dict(
-        block=Bottleneck, layers=(2, 2, 2, 2), cardinality=32, base_width=4, stem_width=32,
+        block=Bottleneck, layers=(3, 4, 6, 3), cardinality=32, base_width=4, stem_width=32,
         stem_type='deep_tiered', avg_down=True, block_args=dict(attn_layer='eca'))
     return _create_resnet('ecaresnext50t_32x4d', pretrained, **dict(model_args, **kwargs))
 

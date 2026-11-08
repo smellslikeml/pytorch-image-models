@@ -42,15 +42,21 @@ def _torch_load(
         checkpoint_path: str,
         map_location: Union[str, torch.device] = 'cpu',
         weights_only: bool = True,
+        mmap: bool = False,
 ):
     use_safe_globals = weights_only and hasattr(torch.serialization, 'safe_globals')
+    load_kwargs = dict(map_location=map_location, weights_only=weights_only)
+    if mmap:
+        load_kwargs['mmap'] = True  # cheap metadata reads of large checkpoints, torch >= 2.1
     try:
         if use_safe_globals:
             # Compatibility: timm training checkpoints often include argparse.Namespace in `args`.
             with torch.serialization.safe_globals([argparse.Namespace]):
-                return torch.load(checkpoint_path, map_location=map_location, weights_only=weights_only)
-        return torch.load(checkpoint_path, map_location=map_location, weights_only=weights_only)
+                return torch.load(checkpoint_path, **load_kwargs)
+        return torch.load(checkpoint_path, **load_kwargs)
     except TypeError as e:
+        if mmap:
+            return _torch_load(checkpoint_path, map_location=map_location, weights_only=weights_only)
         if not weights_only:
             return torch.load(checkpoint_path, map_location=map_location)
         raise RuntimeError(
@@ -108,23 +114,28 @@ def _load_npz_checkpoint(
     return weights
 
 
-def _remove_prefix(text: str, prefix: str) -> str:
-    # FIXME replace with 3.9 stdlib fn when min at 3.9
-    if text.startswith(prefix):
-        return text[len(prefix):]
-    return text
+if hasattr(str, 'removeprefix'):
+    _remove_prefix = str.removeprefix
+else:
+    def _remove_prefix(text: str, prefix: str) -> str:
+        # FIXME remove when min python is 3.9
+        if text.startswith(prefix):
+            return text[len(prefix):]
+        return text
 
 
 def clean_state_dict(state_dict: Dict[str, Any]) -> Dict[str, Any]:
-    # 'clean' checkpoint by removing .module prefix from state dict if it exists from parallel training
+    # 'clean' checkpoint by removing DDP / torchcompile wrapper prefixes, wrapped in either order
     cleaned_state_dict = {}
     to_remove = (
+        '_orig_mod.',  # torchcompile wrapping DDP
         'module.',  # DDP wrapper
         '_orig_mod.',  # torchcompile dynamo wrapper
     )
     for k, v in state_dict.items():
-        for r in to_remove:
-            k = _remove_prefix(k, r)
+        if k.startswith(to_remove):  # fast path for already clean keys
+            for r in to_remove:
+                k = _remove_prefix(k, r)
         cleaned_state_dict[k] = v
     return cleaned_state_dict
 

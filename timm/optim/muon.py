@@ -21,6 +21,7 @@ Based on implementation by Keller Jordan, see
 Hacked together by Ross Wightman
 """
 import logging
+import math
 import numbers
 import warnings
 from typing import List, Mapping, Optional, Sequence, Tuple, Union
@@ -191,6 +192,8 @@ def zeropower_via_newtonschulz(
 
         # Perform Newton-Schulz iterations
         for a, b, c in coeff_sequence:
+            # CPU baddbmm before PyTorch 2.1 can propagate NaNs from A despite beta=0:
+            # https://github.com/pytorch/pytorch/pull/96086
             mm_fn(A, X, X.mT, beta=0.0, alpha=1.0, out=A)  # A = X @ X.mT
             mm_fn(A, A, A, beta=b, alpha=c, out=B)  # B = b * A + c * A @ A
             mm_fn(X, B, X, beta=a, alpha=1.0, out=C)  # C = a * X + B @ X
@@ -238,7 +241,7 @@ def get_adamuon_lr_scale(
     """Adjust learning rate based on parameter shape for AdaMuon.
 
     Args:
-        param_shape: Shape of the parameter tensor
+        param_shape: Shape of the update that went through Newton-Schulz, (out, in) or (spatial_prod, out, in)
         adjust_lr_fn: Scaling function name
 
     Returns:
@@ -249,7 +252,8 @@ def get_adamuon_lr_scale(
     if adjust_lr_fn == "match_rms_adamw":
         # AdaMuon paper: normalize by RMS, then scale by 0.2 * sqrt(numel)
         # https://arxiv.org/abs/2507.11005
-        return 0.2 * (out_chs * in_chs) ** 0.5, True
+        # Match the norm over the whole tensor, including spatial batches.
+        return 0.2 * math.prod(param_shape) ** 0.5, True
     elif adjust_lr_fn == "rms_to_rms":
         return (out_chs / in_chs) ** 0.5, False
     elif adjust_lr_fn == "rsqrt_in":
@@ -489,7 +493,7 @@ def _single_tensor_muon(
 
         # Update momentum buffer
         momentum_buf.lerp_(grad, 1. - momentum)
-        update = grad.lerp_(momentum_buf, momentum) if nesterov else momentum_buf.clone()
+        update = grad.lerp(momentum_buf, momentum) if nesterov else momentum_buf.clone()
 
         # Reshape for processing (handle 3D+ tensors like conv weights)
         if update.ndim >= 3:
@@ -582,7 +586,7 @@ def _single_tensor_adamuon(
 
         # Update momentum buffer
         momentum_buf.lerp_(grad, 1. - momentum)
-        update = grad.lerp_(momentum_buf, momentum) if nesterov else momentum_buf.clone()
+        update = grad.lerp(momentum_buf, momentum) if nesterov else momentum_buf.clone()
 
         # Reshape for processing (handle 3D+ tensors like conv weights)
         if update.ndim >= 3:
@@ -601,6 +605,12 @@ def _single_tensor_adamuon(
             scale_eps=scale_eps,
         )
 
+        # Scale from the orthogonalized matrix dimensions before restoring the convolution shape.
+        if adjust_lr_fn:
+            scale, use_rms_norm = get_adamuon_lr_scale(update_ortho.shape, adjust_lr_fn)
+        else:
+            scale, use_rms_norm = 1.0, False
+
         # Reshape back to original shape for second moment tracking
         if conv_mode == "batched" and update_ortho.ndim >= 3:
             # Permute back: (spatial_prod, out, in) -> (out, in, spatial_prod)
@@ -609,12 +619,6 @@ def _single_tensor_adamuon(
 
         # Update second moment on orthogonalized directions (element-wise)
         exp_avg_sq.mul_(beta2).addcmul_(update_ortho, update_ortho, value=1.0 - beta2)
-
-        # Get shape-based LR scaling and whether to apply RMS normalization
-        if adjust_lr_fn:
-            scale, use_rms_norm = get_adamuon_lr_scale(update_ortho.shape, adjust_lr_fn)
-        else:
-            scale, use_rms_norm = 1.0, False
 
         if use_rms_norm:
             # Bias correction not needed if scaling by norm
@@ -631,7 +635,7 @@ def _single_tensor_adamuon(
         # RMS-aligned rescaling: normalize by update norm, then scale by shape factor
         # Used by AdaMuon paper approach (match_rms_adamw), not by μP approach (rms_to_rms)
         if use_rms_norm:
-            # eq(8) in AdaMuon paper, 0.2 / RMS(update) = 0.2 * sqrt(ndim) / frob(update)
+            # eq(8) in AdaMuon paper, 0.2 / RMS(update) = 0.2 * sqrt(numel) / frob(update)
             update_norm = update_adaptive.norm().add_(eps)
             update_adaptive = update_adaptive / update_norm
 
@@ -710,18 +714,25 @@ class Muon(torch.optim.Optimizer):
                 tensor learning rates and requires optimizer state tensors to live on the parameter device.
             verbose: Log parameter routing decisions (Muon vs AdamW)
 
-        Example:
+        Examples:
+            Muon for 2D+ parameters and the AdamW fallback for 1D parameters, selected automatically:
+
             ```python
-            # Simple usage - automatically uses Muon for 2D+ params, AdamW for 1D
             optimizer = Muon(model.parameters(), lr=0.02)
+            ```
 
-            # Use AdaMuon algorithm for adaptive scaling
+            The AdaMuon algorithm for adaptive scaling:
+
+            ```python
             optimizer = Muon(model.parameters(), lr=6e-4, algo="adamuon")
+            ```
 
-            # Manual control over parameter groups
+            Manual control over the parameter groups, `use_fallback=True` selects AdamW for a group:
+
+            ```python
             optimizer = Muon([
                 {'params': weight_matrices, 'lr': 0.02},
-                {'params': biases, 'use_fallback': True, 'lr': 3e-4}, # use AdamW if use_fallback=True
+                {'params': biases, 'use_fallback': True, 'lr': 3e-4},
             ])
             ```
         """
@@ -776,8 +787,13 @@ class Muon(torch.optim.Optimizer):
             group.setdefault('capturable', False)
             # Migrate old adamw_lr to fallback_lr_scale for checkpoint compat
             if 'fallback_lr_scale' not in group:
-                adamw_lr = group.pop('adamw_lr', group['lr'])
-                group['fallback_lr_scale'] = adamw_lr / group['lr'] if group['lr'] != 0 else 1.0
+                adamw_lr = group.pop('adamw_lr', None)
+                # use the un-scheduled lr if a scheduler has set it, the saved lr may be mid warmup / decay
+                base_lr = group.get('initial_lr', group['lr'])
+                if adamw_lr is not None and base_lr != 0:
+                    group['fallback_lr_scale'] = adamw_lr / base_lr
+                else:
+                    group['fallback_lr_scale'] = 1.0
 
     @torch.no_grad()
     def step(self, closure=None):

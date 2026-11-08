@@ -2,7 +2,14 @@
 
 A PyTorch impl of MobileNet-V3, compatible with TF weights from official impl.
 
-Paper: Searching for MobileNetV3 - https://arxiv.org/abs/1905.02244
+Also covers related architectures built from the same blocks: FBNet-V3, LCNet, and MobileNet-V4.
+
+Papers:
+* `Searching for MobileNetV3` - https://arxiv.org/abs/1905.02244
+* `FBNetV3: Joint Architecture-Recipe Search using Predictor Pretraining` - https://arxiv.org/abs/2006.02049
+* `PP-LCNet: A Lightweight CPU Convolutional Neural Network` - https://arxiv.org/abs/2109.15099
+* `MobileNetV4 -- Universal Models for the Mobile Ecosystem` - https://arxiv.org/abs/2404.10518
+* `ImageNet-21K Pretraining for the Masses` - https://arxiv.org/abs/2104.10972
 
 Hacked together by / Copyright 2019, Ross Wightman
 """
@@ -188,17 +195,24 @@ class MobileNetV3(nn.Module):
         """Get the classifier head."""
         return self.classifier
 
-    def reset_classifier(self, num_classes: int, global_pool: str = 'avg') -> None:
+    def reset_classifier(self, num_classes: int, global_pool: Optional[str] = None) -> None:
         """Reset the classifier head.
 
         Args:
             num_classes: Number of classes for new classifier.
-            global_pool: Global pooling type.
+            global_pool: Global pooling type, current pooling is kept if None.
         """
         dd = get_device_dtype(self)
         self.num_classes = num_classes
+        if global_pool is None:
+            global_pool = self.global_pool.pool_type
         # NOTE: cannot meaningfully change pooling of efficient head after creation
         self.global_pool = SelectAdaptivePool2d(pool_type=global_pool)
+        if isinstance(self.conv_head, nn.Identity):
+            self.head_hidden_size = self.num_features * self.global_pool.feat_mult()  # pooled, no head conv
+        else:
+            assert self.conv_head.in_channels == self.num_features * self.global_pool.feat_mult(), \
+                'The head conv is sized for the pooled width, pooling can not change it.'
         self.global_pool.train(self.training)
         self.flatten = nn.Flatten(1) if global_pool else nn.Identity()  # don't flatten if pooling disabled
         self.flatten.train(self.training)
@@ -283,16 +297,25 @@ class MobileNetV3(nn.Module):
         """
         if extra_blocks:
             take_indices, max_index = feature_take_indices(len(self.blocks) + 1, indices)
+            # idx 0 is the stem
+            num_chs = (
+                self.blocks[max_index - 1][-1].feature_info('bottleneck')['num_chs'] if max_index
+                else self.conv_stem.out_channels
+            )
         else:
             take_indices, max_index = feature_take_indices(len(self.stage_ends), indices)
+            num_chs = self.feature_info[max_index]['num_chs']
             max_index = self.stage_ends[max_index]
+        prune_end = max_index < len(self.blocks)
         self.blocks = self.blocks[:max_index]  # truncate blocks w/ stem as idx 0
-        if max_index < len(self.blocks):
+        if prune_end:
+            # features now end at the last kept tap, the head is sized for the final features so it goes too
+            self.num_features = num_chs
+        if prune_end or prune_head:
+            # the pre-logits conv (+ norm, act) is part of the head and follows the last stage
             self.conv_head = nn.Identity()
             self.norm_head = nn.Identity()
-        if prune_head:
-            self.conv_head = nn.Identity()
-            self.norm_head = nn.Identity()
+            self.act2 = nn.Identity()
             self.reset_classifier(0, '')
         return take_indices
 

@@ -11,13 +11,17 @@ tests will be skipped on CI.
 
 """
 
+import copy
 import pytest
 import torch
 import platform
 import os
 import fnmatch
+import inspect
+from contextlib import nullcontext
 
 _IS_MAC = platform.system() == 'Darwin'
+_HAS_DEVICE_CONTEXT = hasattr(torch.device, '__enter__')
 
 try:
     from torchvision.models.feature_extraction import create_feature_extractor, get_graph_node_names, NodePathTracer
@@ -57,7 +61,10 @@ FEAT_INTER_FILTERS = [
     'tiny_vit', 'vovnet', 'tresnet', 'rexnet', 'resnetv2', 'repghost', 'repvit', 'pvt_v2', 'nextvit', 'nest',
     'mambaout', 'inception_next', 'inception_v4', 'hgnet', 'gcvit', 'focalnet', 'efficientformer_v2', 'edgenext',
     'davit', 'rdnet', 'convnext', 'pit', 'starnet', 'shvit', 'fasternet', 'swiftformer', 'ghostnet', 'naflexvit',
-    'csatv2', 'cpubone', 'lcnetv2', 'lowformer'
+    'csatv2', 'cpubone', 'lcnetv2', 'lowformer', 'qwen3_vit', 'iformer', 'efficientvim', 'deepseek_vit',
+    'efficientvit_mit', 'cspnext', 'dpn', 'mobilenetv5', 'cspnet', 'nfnet', 'dla', 'densenet',
+    'coat', 'convit', 'convmixer', 'crossvit', 'hrnet', 'inception_resnet_v2', 'inception_v3', 'nasnet',
+    'pnasnet', 'selecsls', 'senet', 'sequencer', 'vgg', 'visformer', 'xception', 'xception_aligned',
 ]
 
 # transformer / hybrid models don't support full set of spatial / feature APIs and/or have spatial output.
@@ -66,7 +73,7 @@ NON_STD_FILTERS = [
     'convit_*', 'levit*', 'visformer*', 'deit*', 'xcit_*', 'crossvit_*', 'beit*', 'aimv2*', 'swiftformer_*',
     'poolformer_*', 'volo_*', 'sequencer2d_*', 'mvitv2*', 'gcvit*', 'efficientformer*', 'sam_hiera*',
     'eva_*', 'flexivit*', 'eva02*', 'samvit_*', 'efficientvit_m*', 'tiny_vit_*', 'hiera_*', 'vitamin*', 'test_vit*',
-    'gemma4_vit*',
+    'gemma4_vit*', 'qwen3_vit*', 'efficientvim*', 'deepseek_vit*',
 ]
 NUM_NON_STD = len(NON_STD_FILTERS)
 
@@ -77,14 +84,15 @@ if 'GITHUB_ACTIONS' in os.environ:
         '*efficientnet_l2*', '*resnext101_32x48d', '*in21k', '*152x4_bitm', '*101x3_bitm', '*50x3_bitm',
         '*nfnet_f3*', '*nfnet_f4*', '*nfnet_f5*', '*nfnet_f6*', '*nfnet_f7*', '*efficientnetv2_xl*',
         '*resnetrs350*', '*resnetrs420*', 'xcit_large_24_p8*', '*huge*', '*giant*', '*gigantic*',
-        '*enormous*', 'maxvit_xlarge*', 'regnet*1280', 'regnet*2560', '*_1b_*', '*_3b_*', '*_7b_*']
-    NON_STD_EXCLUDE_FILTERS = ['*huge*', '*giant*',  '*gigantic*', '*enormous*', '*_1b_*', '*_3b_*', '*_7b_*']
+        '*enormous*', 'maxvit_xlarge*', 'regnet*1280', 'regnet*2560', '*_1b_*', '*_3b_*', '*_5b_*', '*_7b_*']
+    NON_STD_EXCLUDE_FILTERS = [
+        '*huge*', '*giant*',  '*gigantic*', '*enormous*', '*_1b_*', '*_3b_*', '*_5b_*', '*_7b_*']
 else:
-    EXCLUDE_FILTERS = ['*enormous*', '*_7b_*']
-    NON_STD_EXCLUDE_FILTERS = ['*gigantic*', '*enormous*', '*_3b_*', '*_7b_*']
+    EXCLUDE_FILTERS = ['*enormous*', '*_5b_*', '*_7b_*']
+    NON_STD_EXCLUDE_FILTERS = ['*gigantic*', '*enormous*', '*_3b_*', '*_5b_*', '*_7b_*']
 
 EXCLUDE_JIT_FILTERS = [
-    'hiera_*', '*naflex*', '*_7b_*', 'hrnet*', 'dpn*', 'densenet*', 'selecsls*',
+    'hiera_*', '*naflex*', '*_5b_*', '*_7b_*', 'hrnet*', 'densenet*', 'selecsls*',
     # gemma4_vit shares NaFlex's ``Union[Tensor, Dict[str, Tensor]]`` forward signature,
     # which TorchScript cannot narrow (``Unknown type name 'dict'``).
     'gemma4_vit*',
@@ -173,7 +181,7 @@ def test_model_inference(model_name, batch_size):
         _test_owl(pp(test_owl).unsqueeze(0), tol=(1e-1, 1e-1))  # re-process from original jpg, Pillow output can change a lot btw ver
 
 
-@pytest.mark.base
+@pytest.mark.forward
 @pytest.mark.timeout(timeout120)
 @pytest.mark.parametrize('model_name', list_models(exclude_filters=EXCLUDE_FILTERS))
 @pytest.mark.parametrize('batch_size', [1])
@@ -206,7 +214,7 @@ def test_model_forward(model_name, batch_size):
         assert torch.allclose(outputs, outputs2, rtol=1e-4, atol=1e-5), 'Output does not match'
 
 
-@pytest.mark.base
+@pytest.mark.backward
 @pytest.mark.timeout(timeout120)
 @pytest.mark.parametrize('model_name', list_models(exclude_filters=EXCLUDE_FILTERS, name_matches_cfg=True))
 @pytest.mark.parametrize('batch_size', [2])
@@ -233,9 +241,11 @@ def test_model_backward(model_name, batch_size):
     num_grad = sum([x.grad.numel() for x in model.parameters() if x.grad is not None])
 
     if encoder_only:
-        output_fmt = getattr(model, 'output_fmt', 'NCHW')
-        feat_axis = get_channel_dim(output_fmt)
-        assert outputs.shape[feat_axis] == model.num_features, f'unpooled feature dim {outputs.shape[feat_axis]} != model.num_features {model.num_features}'
+        feat_axis = getattr(model, 'feature_dim', None)
+        if feat_axis is None:
+            feat_axis = get_channel_dim(getattr(model, 'output_fmt', 'NCHW'))
+        output_features = getattr(model, 'out_features', None) or model.num_features
+        assert outputs.shape[feat_axis] == output_features, f'encoder output dim != {output_features}'
     else:
         assert outputs.shape[-1] == 42
     assert num_params == num_grad, 'Some parameters are missing gradients'
@@ -254,6 +264,39 @@ EARLY_POOL_MODELS = (
     timm.models.RepGhostNet,
     timm.models.VGG,
 )
+
+
+def _assert_model_api_contract(model, model_name, cfg_device):
+    """Check parts of the model API the optimizer factory and model creation rely on, for every model."""
+    from timm.models._manipulate import group_parameters
+
+    # unknown constructor args must raise, not be silently ignored
+    with torch.device(cfg_device) if _HAS_DEVICE_CONTEXT else nullcontext():
+        with pytest.raises(TypeError):
+            create_model(model_name, pretrained=False, device=cfg_device, not_a_model_arg=1)
+
+    # reset_classifier keeps the current pooling by default
+    if hasattr(model, 'reset_classifier'):
+        param = inspect.signature(model.reset_classifier).parameters.get('global_pool')
+        if param is not None:
+            assert param.default is None, f'reset_classifier global_pool default is {param.default!r}, not None'
+
+    # group_matcher() / no_weight_decay() must match the model's params
+    param_names = [n for n, _ in model.named_parameters()]
+    if hasattr(model, 'group_matcher'):
+        groups = group_parameters(model, model.group_matcher(coarse=False), reverse=True)
+        assert len(set(groups.values())) > 1, 'group_matcher() puts all params in a single group'
+    if hasattr(model, 'no_weight_decay'):
+        for pattern in model.no_weight_decay():
+            if any(fnmatch.fnmatch(n, pattern) for n in param_names):
+                continue
+            # an optional param (e.g. a class or register token) can be listed when this config doesn't use it
+            obj = model
+            for attr in pattern.split('.'):
+                obj = getattr(obj, attr, None)
+                if obj is None:
+                    break
+            assert obj is None, f'no_weight_decay() entry {pattern!r} matches no parameter'
 
 
 def _assert_reset_classifier_preserves_parent_device_dtype(model):
@@ -278,21 +321,69 @@ def _assert_reset_classifier_preserves_parent_device_dtype(model):
     assert all(module.training == expected_training for module in model.modules())
 
 
+# NOTE the helpers below run on the meta device for every model, they cover structure and device / dtype / requires_grad
+# propagation only. Numerical and cache correctness still need targeted real-tensor tests.
+def _assert_frozen_survives_reset_and_resize(model_name, cfg_device, reset_pool=True):
+    """reset_classifier(0, ...) and set_input_size() rebuild modules from existing weights, must keep them frozen."""
+    model = create_model(model_name, pretrained=False, device=cfg_device, dtype=torch.float32)
+    model.requires_grad_(False)
+    reset_classifier = getattr(model, 'reset_classifier', None)
+    if callable(reset_classifier):
+        reset_classifier(0)
+        if reset_pool and not isinstance(model, EARLY_POOL_MODELS):
+            reset_classifier(0, '')
+    set_input_size = getattr(model, 'set_input_size', None)
+    if callable(set_input_size):
+        set_input_size(img_size=tuple(2 * s for s in model.default_cfg['input_size'][-2:]))
+    trainable = [n for n, p in model.named_parameters() if p.requires_grad]
+    assert not trainable, f'frozen parameters became trainable: {trainable[:5]}'
+
+
+def _assert_factory_device(model_name, cfg_device):
+    """create_model(device=...) without a device context must place every param and buffer on that device."""
+    model = create_model(model_name, pretrained=False, device=cfg_device, dtype=torch.float32)
+    expected = torch.device(cfg_device)
+    misplaced = [n for n, t in [*model.named_parameters(), *model.named_buffers()] if t.device != expected]
+    assert not misplaced, f'tensors not created on {expected}: {misplaced[:5]}'
+
+
+def _assert_dtype_change_after_forward(model, input_tensor, dtype=torch.bfloat16):
+    """Converting dtype after a forward must not leave stale caches or upcast activations."""
+    model.to(dtype)
+    output = model(input_tensor.to(dtype))
+    if isinstance(output, (tuple, list)):
+        output = output[0]
+    assert output.dtype == dtype, f'output dtype {output.dtype} != {dtype} after .to({dtype})'
+    model.to(torch.float32)
+
+
+@pytest.fixture
+def cfg_device():
+    # Config tests only inspect structure and shapes; retain real tensors on older torch.
+    return 'meta' if _HAS_DEVICE_CONTEXT else torch_device
+
+
 @pytest.mark.cfg
 @pytest.mark.timeout(timeout360)
-@pytest.mark.parametrize('model_name', list_models(
-    exclude_filters=EXCLUDE_FILTERS + NON_STD_FILTERS, include_tags=True))
+@pytest.mark.parametrize(
+    'model_name',
+    list_models(
+        exclude_filters=EXCLUDE_FILTERS + NON_STD_FILTERS,
+        include_tags=True,
+    ),
+)
 @pytest.mark.parametrize('batch_size', [1])
-def test_model_default_cfgs(model_name, batch_size):
-    """Run a single forward pass with each model"""
-    model = create_model(model_name, pretrained=False)
-    model.eval()
-    model.to(torch_device)
+def test_model_default_cfgs(model_name, batch_size, cfg_device):
+    """Check config metadata and feature/head shapes without allocating weights on modern torch."""
+    with torch.device(cfg_device) if _HAS_DEVICE_CONTEXT else nullcontext():
+        model = create_model(model_name, pretrained=False, device=cfg_device, dtype=torch.float32).eval()
+    _assert_model_api_contract(model, model_name, cfg_device)
     assert getattr(model, 'num_classes') >= 0
     assert getattr(model, 'num_features') > 0
     assert getattr(model, 'head_hidden_size') > 0
     state_dict = model.state_dict()
     cfg = model.default_cfg
+    assert model.in_chans == cfg['input_size'][0]
 
     pool_size = cfg['pool_size']
     input_size = model.default_cfg['input_size']
@@ -305,7 +396,7 @@ def test_model_default_cfgs(model_name, batch_size):
             not any([fnmatch.fnmatch(model_name, x) for x in EXCLUDE_FILTERS]):
         # output sizes only checked if default res <= 448 * 448 to keep resource down
         input_size = tuple([min(x, MAX_FWD_OUT_SIZE) for x in input_size])
-        input_tensor = torch.randn((batch_size, *input_size), device=torch_device)
+        input_tensor = torch.randn((batch_size, *input_size), device=cfg_device)
 
         # test forward_features (always unpooled) & forward_head w/ pre_logits
         outputs = model.forward_features(input_tensor)
@@ -314,11 +405,12 @@ def test_model_default_cfgs(model_name, batch_size):
         assert outputs.shape[spatial_axis[1]] == pool_size[1], f'unpooled feature shape {outputs.shape} != config'
         assert outputs.shape[feat_axis] == model.num_features, f'unpooled feature dim {outputs.shape[feat_axis]} != model.num_features {model.num_features}'
         assert outputs_pre.shape[1] == model.head_hidden_size, f'pre_logits feature dim {outputs_pre.shape[1]} != model.head_hidden_size {model.head_hidden_size}'
+        if _HAS_DEVICE_CONTEXT:
+            _assert_dtype_change_after_forward(model, input_tensor)
 
         # test forward after deleting the classifier, output should be poooled, size(-1) == model.num_features
         model.reset_classifier(0)
         assert model.num_classes == 0, f'Expected num_classes to be 0 after reset_classifier(0), but got {model.num_classes}'
-        model.to(torch_device)
         outputs = model.forward(input_tensor)
         assert len(outputs.shape) == 2
         assert outputs.shape[1] == model.head_hidden_size, f'feature dim w/ removed classifier {outputs.shape[1]} != model.head_hidden_size {model.head_hidden_size}'
@@ -327,15 +419,24 @@ def test_model_default_cfgs(model_name, batch_size):
         # test model forward after removing pooling and classifier
         if not isinstance(model, EARLY_POOL_MODELS):
             model.reset_classifier(0, '')  # reset classifier and disable global pooling
-            model.to(torch_device)
             outputs = model.forward(input_tensor)
             assert len(outputs.shape) == 4
             assert outputs.shape[spatial_axis[0]] == pool_size[0] and outputs.shape[spatial_axis[1]] == pool_size[1]
 
+        # test classifier deletion via __init__, output should match reset_classifier(0)
+        model = create_model(
+            model_name, pretrained=False, num_classes=0, device=cfg_device, dtype=torch.float32,
+        ).eval()
+        outputs = model.forward(input_tensor)
+        assert outputs.shape == outputs_pre.shape, f'output shape w/ num_classes=0 {outputs.shape} != pre_logits {outputs_pre.shape}'
+        assert outputs.shape[1] == model.head_hidden_size, f'feature dim w/ num_classes=0 {outputs.shape[1]} != model.head_hidden_size {model.head_hidden_size}'
+
         # test classifier + global pool deletion via __init__
         if 'pruned' not in model_name and not isinstance(model, EARLY_POOL_MODELS):
-            model = create_model(model_name, pretrained=False, num_classes=0, global_pool='').eval()
-            model.to(torch_device)
+            # Explicit factory kwargs must also work without the device context.
+            model = create_model(
+                model_name, pretrained=False, num_classes=0, global_pool='', device=cfg_device, dtype=torch.float32,
+            ).eval()
             outputs = model.forward(input_tensor)
             assert len(outputs.shape) == 4
             assert outputs.shape[spatial_axis[0]] == pool_size[0] and outputs.shape[spatial_axis[1]] == pool_size[1]
@@ -357,29 +458,35 @@ def test_model_default_cfgs(model_name, batch_size):
         assert fc + ".weight" in state_dict.keys(), f'{fc} not in model params'
 
     _assert_reset_classifier_preserves_parent_device_dtype(model)
+    if _HAS_DEVICE_CONTEXT:
+        # extra model creations are only cheap on the meta device
+        _assert_factory_device(model_name, cfg_device)
+        _assert_frozen_survives_reset_and_resize(model_name, cfg_device)
 
 
 @pytest.mark.cfg
+@pytest.mark.cfg_nonstd
 @pytest.mark.timeout(timeout360)
 @pytest.mark.parametrize('model_name', list_models(filter=NON_STD_FILTERS, exclude_filters=NON_STD_EXCLUDE_FILTERS, include_tags=True))
 @pytest.mark.parametrize('batch_size', [1])
-def test_model_default_cfgs_non_std(model_name, batch_size):
-    """Run a single forward pass with each model"""
-    model = create_model(model_name, pretrained=False)
-    model.eval()
-    model.to(torch_device)
+def test_model_default_cfgs_non_std(model_name, batch_size, cfg_device):
+    """Check non-standard model config metadata and feature/head shapes."""
+    with torch.device(cfg_device) if _HAS_DEVICE_CONTEXT else nullcontext():
+        model = create_model(model_name, pretrained=False, device=cfg_device, dtype=torch.float32).eval()
+    _assert_model_api_contract(model, model_name, cfg_device)
     assert getattr(model, 'num_classes') >= 0
     assert getattr(model, 'num_features') > 0
     assert getattr(model, 'head_hidden_size') > 0
     state_dict = model.state_dict()
     cfg = model.default_cfg
+    assert model.in_chans == cfg['input_size'][0]
 
     input_size = _get_input_size(model=model)
     if max(input_size) > 320:  # FIXME const
         _assert_reset_classifier_preserves_parent_device_dtype(model)
         pytest.skip("Fixed input size model > limit.")
 
-    input_tensor = torch.randn((batch_size, *input_size), device=torch_device)
+    input_tensor = torch.randn((batch_size, *input_size), device=cfg_device)
     feat_dim = getattr(model, 'feature_dim', None)
 
     outputs = model.forward_features(input_tensor)
@@ -392,11 +499,12 @@ def test_model_default_cfgs_non_std(model_name, batch_size):
             feat_dim = -1 if outputs.ndim == 3 else 1
         assert outputs.shape[feat_dim] == model.num_features
         assert outputs_pre.shape[1] == model.head_hidden_size
+    if _HAS_DEVICE_CONTEXT:
+        _assert_dtype_change_after_forward(model, input_tensor)
 
     # test forward after deleting the classifier, output should be poooled, size(-1) == model.num_features
     model.reset_classifier(0)
     assert model.num_classes == 0, f'Expected num_classes to be 0 after reset_classifier(0), but got {model.num_classes}'
-    model.to(torch_device)
     outputs = model.forward(input_tensor)
     if isinstance(outputs,  (tuple, list)):
         outputs = outputs[0]
@@ -405,14 +513,17 @@ def test_model_default_cfgs_non_std(model_name, batch_size):
     assert outputs.shape[feat_dim] == model.head_hidden_size, 'pooled num_features != config'
     assert outputs.shape == outputs_pre.shape
 
-    model = create_model(model_name, pretrained=False, num_classes=0).eval()
-    model.to(torch_device)
+    # Explicit factory kwargs must also work without the device context.
+    model = create_model(
+        model_name, pretrained=False, num_classes=0, device=cfg_device, dtype=torch.float32,
+    ).eval()
     outputs = model.forward(input_tensor)
     if isinstance(outputs, (tuple, list)):
         outputs = outputs[0]
     if feat_dim is None:
         feat_dim = -1 if outputs.ndim == 3 else 1
     assert outputs.shape[feat_dim] == model.num_features
+    assert outputs.shape[feat_dim] == model.head_hidden_size
 
     # check classifier name matches default_cfg
     if cfg.get('num_classes', None):
@@ -431,6 +542,11 @@ def test_model_default_cfgs_non_std(model_name, batch_size):
         assert fc + ".weight" in state_dict.keys(), f'{fc} not in model params'
 
     _assert_reset_classifier_preserves_parent_device_dtype(model)
+    if _HAS_DEVICE_CONTEXT:
+        # extra model creations are only cheap on the meta device
+        _assert_factory_device(model_name, cfg_device)
+        # non-std models don't all support global_pool=''
+        _assert_frozen_survives_reset_and_resize(model_name, cfg_device, reset_pool=False)
 
 
 if 'GITHUB_ACTIONS' not in os.environ:
@@ -450,6 +566,69 @@ if 'GITHUB_ACTIONS' not in os.environ:
         create_model(model_name, pretrained=True, features_only=True)
 
 
+@pytest.mark.base
+@pytest.mark.parametrize('model_name', ['test_resnet', 'test_efficientnet', 'densenet121', 'test_convnext'])
+def test_reset_classifier_keeps_pool(model_name):
+    model = create_model(model_name, pretrained=False, global_pool='max').eval()
+    x = torch.randn(2, 3, 64, 64)
+    with torch.no_grad():
+        expected = model.forward_head(model.forward_features(x), pre_logits=True)
+        model.reset_classifier(5)
+        torch.testing.assert_close(model.forward_head(model.forward_features(x), pre_logits=True), expected)
+        assert model(x).shape == (2, 5)
+        model.reset_classifier(5, 'avg')
+        pooled_avg = model.forward_head(model.forward_features(x), pre_logits=True)
+        assert not torch.allclose(pooled_avg, expected)
+
+
+
+@pytest.mark.base
+def test_gcvit_batch_consistency():
+    # each image's global query must reach only that image's windows: batched output == per-image output
+    torch.manual_seed(0)
+    model = create_model('gcvit_xxtiny', pretrained=False).eval()
+    x = torch.randn(3, 3, 224, 224)
+    with torch.no_grad():
+        batched = model(x)
+        single = torch.cat([model(x[i:i + 1]) for i in range(x.shape[0])])
+    torch.testing.assert_close(batched, single, rtol=1e-4, atol=1e-4)
+
+
+@pytest.mark.base
+@pytest.mark.parametrize('model_name', ['resnet18', 'resnet50d', 'convnext_atto'])
+def test_features_only_grad_checkpointing_backward(model_name):
+    # backbones built with features_only=True are trained with gradient checkpointing in detection/segmentation
+    # pipelines; backward must work and give the same gradients as without checkpointing
+    x = torch.randn(2, 3, 64, 64)
+    grads = []
+    for grad_checkpointing in (False, True):
+        torch.manual_seed(0)
+        model = create_model(model_name, pretrained=False, features_only=True).train()
+        model.set_grad_checkpointing(grad_checkpointing)
+        sum(f.pow(2).mean() for f in model(x)).backward()
+        grads.append([p.grad for p in model.parameters() if p.grad is not None])
+    assert len(grads[0]) == len(grads[1])
+    for g0, g1 in zip(*grads):
+        torch.testing.assert_close(g1, g0)
+
+
+@pytest.mark.base
+def test_feature_hook_net_grad_checkpointing_order():
+    # checkpoint recompute in backward re-fires feature hooks, output order must not change on next forward
+    model = create_model('xception41', pretrained=False, features_only=True).train()
+    x = torch.randn(2, 3, 64, 64)
+    with torch.no_grad():
+        ref = model(x)
+    model.set_grad_checkpointing(True)
+    for _ in range(2):
+        out = model(x)
+        assert len(out) == len(ref)
+        for o, r in zip(out, ref):
+            torch.testing.assert_close(o, r)
+        sum(o.mean() for o in out).backward()
+
+
+@pytest.mark.base
 @pytest.mark.parametrize(
     'model_name',
     ['efficientnet_b1_pruned', 'efficientnet_b2_pruned', 'efficientnet_b3_pruned'],
@@ -461,6 +640,21 @@ def test_pruned_efficientnet_in_chans(model_name):
     assert model.conv_stem.in_channels == 1
     with torch.no_grad():
         assert model(torch.randn(1, 1, 32, 32)).shape == (1, 1000)
+
+
+@pytest.mark.base
+def test_convit_dtype_change_after_forward():
+    """GPSA.rel_indices is cached on the first forward; a dtype change afterwards must
+    still be picked up since the cached tensor's shape doesn't change."""
+    model = create_model('convit_tiny', pretrained=False)
+    model.eval()
+    x = torch.randn(1, 3, 224, 224)
+    with torch.no_grad():
+        model(x)  # populate the rel_indices cache in float32
+    model.to(torch.bfloat16)
+    with torch.no_grad():
+        out = model(x.to(torch.bfloat16))
+    assert out.dtype == torch.bfloat16
 
 
 @pytest.mark.torchscript
@@ -486,9 +680,7 @@ def test_model_forward_torchscript(model_name, batch_size):
     assert not torch.isnan(outputs).any(), 'Output included NaNs'
 
 
-EXCLUDE_FEAT_FILTERS = [
-    '*pruned*',  # hopefully fix at some point
-] + NON_STD_FILTERS
+EXCLUDE_FEAT_FILTERS = NON_STD_FILTERS[:]
 if 'GITHUB_ACTIONS' in os.environ:  # and 'Linux' in platform.system():
     # GitHub Linux runner is slower and hits memory limits sooner than MacOS, exclude bigger models
     EXCLUDE_FEAT_FILTERS += ['*resnext101_32x32d', '*resnext101_32x16d']
@@ -517,17 +709,48 @@ def test_model_forward_features(model_name, batch_size):
     outputs = model(torch.randn((batch_size, *input_size)))
     assert len(expected_channels) == len(outputs)
     spatial_size = input_size[-2:]
+    # unpadded convs shrink small inputs well below input / reduction
+    valid_padding = any(fnmatch.fnmatch(model_name, f) for f in ('inception_v3*', 'inception_v4*', 'inception_resnet_v2*'))
     for e, r, o in zip(expected_channels, expected_reduction, outputs):
         assert e == o.shape[feat_axis]
         assert o.shape[spatial_axis[0]] <= math.ceil(spatial_size[0] / r) + 1
         assert o.shape[spatial_axis[1]] <= math.ceil(spatial_size[1] / r) + 1
+        if not valid_padding:
+            # catch feature_info reductions that are off by 2x or more
+            assert o.shape[spatial_axis[0]] > spatial_size[0] / (2 * r), f'feature reduction {r} too small'
+            assert o.shape[spatial_axis[1]] > spatial_size[1] / (2 * r), f'feature reduction {r} too small'
         assert o.shape[0] == batch_size
         assert not torch.isnan(o).any()
 
 
 @pytest.mark.features
 @pytest.mark.timeout(120)
-@pytest.mark.parametrize('model_name', list_models(module=FEAT_INTER_FILTERS, exclude_filters=EXCLUDE_FILTERS + ['*pruned*']))
+@pytest.mark.parametrize('model_name', list_models('efficientnet_[hx]_*'))
+def test_model_features_space2depth_reduction(model_name):
+    """The space2depth first block downsamples, feature_info reductions must include it."""
+    model = create_model(model_name, pretrained=False, features_only=True)
+    model.eval()
+    outputs = model(torch.randn((1, 3, 224, 224)))
+    assert model.feature_info.reduction() == [2, 4, 8, 16, 32]
+    assert [o.shape[-1] for o in outputs] == [224 // r for r in model.feature_info.reduction()]
+
+
+@pytest.mark.features
+@pytest.mark.timeout(120)
+@pytest.mark.parametrize('model_name', ['convnext_atto', 'inception_next_atto'])
+@pytest.mark.parametrize('output_stride', [8, 16])
+def test_model_features_output_stride(model_name, output_stride):
+    """Dilated stages must keep feature maps at input size / feature_info reduction."""
+    model = create_model(model_name, pretrained=False, features_only=True, output_stride=output_stride)
+    model.eval()
+    outputs = model(torch.randn((1, 3, 64, 96)))
+    assert max(model.feature_info.reduction()) == output_stride
+    assert [tuple(o.shape[-2:]) for o in outputs] == [(64 // r, 96 // r) for r in model.feature_info.reduction()]
+
+
+@pytest.mark.features
+@pytest.mark.timeout(120)
+@pytest.mark.parametrize('model_name', list_models(module=FEAT_INTER_FILTERS, exclude_filters=EXCLUDE_FILTERS))
 @pytest.mark.parametrize('batch_size', [1])
 def test_model_forward_intermediates_features(model_name, batch_size):
     """Run a single forward pass with each model in feature extraction mode"""
@@ -558,7 +781,7 @@ def test_model_forward_intermediates_features(model_name, batch_size):
 
 @pytest.mark.features
 @pytest.mark.timeout(120)
-@pytest.mark.parametrize('model_name', list_models(module=FEAT_INTER_FILTERS, exclude_filters=EXCLUDE_FILTERS + ['*pruned*']))
+@pytest.mark.parametrize('model_name', list_models(module=FEAT_INTER_FILTERS, exclude_filters=EXCLUDE_FILTERS))
 @pytest.mark.parametrize('batch_size', [1])
 def test_model_forward_intermediates(model_name, batch_size):
     """Run a single forward pass with each model in feature extraction mode"""
@@ -592,7 +815,7 @@ def test_model_forward_intermediates(model_name, batch_size):
         assert not torch.isnan(o).any()
 
     output2 = model.forward_features(inpt)
-    assert torch.allclose(output, output2)
+    torch.testing.assert_close(output, output2, rtol=1e-5, atol=1e-8)
 
     # Test that grad-checkpointing, if supported
     try:
@@ -605,8 +828,411 @@ def test_model_forward_intermediates(model_name, batch_size):
             inpt,
             output_fmt=output_fmt,
         )
-        assert torch.allclose(output, output3, rtol=1e-4, atol=1e-5), 'Output does not match'
+        torch.testing.assert_close(output, output3, rtol=1e-4, atol=1e-5)
 
+
+@pytest.mark.features
+@pytest.mark.parametrize('model_name', ['convit_tiny', 'volo_d1_224', 'twins_svt_small'])
+def test_pruned_features_torchscript(model_name: str) -> None:
+    model = create_model(
+        model_name, img_size=64, features_only=True, feature_cls='getter', out_indices=(0,),
+    ).eval()
+    x = torch.randn(1, 3, 64, 64)
+    with torch.no_grad():
+        expected = model(x)
+        torch.testing.assert_close(torch.jit.script(model)(x), expected)
+
+
+@pytest.mark.features
+@pytest.mark.parametrize('model_name', [
+    'ghostnet_050', 'ghostnetv2_100', 'ghostnetv3_050', 'repghostnet_050',
+    'inception_v4', 'rexnet_100', 'rdnet_tiny', 'xception41', 'xception41p',
+])
+def test_feature_getter_stage_ends_torchscript(model_name: str) -> None:
+    from timm.models._features import FeatureGetterNet
+
+    model = create_model(model_name).eval()
+    x = torch.randn(1, 3, 96, 96)
+    indices = (0, 1, 2)
+    with torch.no_grad():
+        expected = model.forward_intermediates(x, indices=indices, intermediates_only=True)
+        getter = FeatureGetterNet(model, out_indices=indices).eval()
+        torch.testing.assert_close(getter(x), expected)
+        torch.testing.assert_close(torch.jit.script(getter)(x), expected)
+
+
+@pytest.mark.features
+@pytest.mark.parametrize('model_name', [
+    'convnext_atto', 'edgenext_xx_small', 'rdnet_tiny', 'tiny_vit_5m_224', 'coatnet_pico_rw_224', 'mambaout_femto',
+    'inception_next_atto', 'poolformerv2_s12', 'lowformer_b0', 'cpubone_b0_bfrobust', 'efficientvit_b0', 'hgnetv2_b0',
+    'pit_ti_distilled_224', 'volo_d1_224', 'fastvit_t8', 'regnetz_005', 'resnet33ts', 'ese_vovnet19b_dw',
+    'twins_svt_small', 'mvitv2_tiny', 'nest_tiny', 'starnet_s1', 'swin_tiny_patch4_window7_224',
+    'efficientnet_b0', 'vgg11',
+])
+def test_prune_intermediate_layers_params_used(model_name: str) -> None:
+    """Pruning as FeatureGetterNet does leaves no unused params (DDP), forward_intermediates / forward still run."""
+    model = create_model(model_name, drop_rate=0.5)
+    input_size = _get_input_size(model=model, target=TARGET_FFEAT_SIZE)
+    x = torch.randn((2, *input_size))
+    num_features = len(model.feature_info)
+    # prune_norm=False is FeatureGetterNet w/ norm=True
+    for indices, prune_norm in (([0], False), ([num_features - 1], False), (list(range(num_features)), True)):
+        pruned = copy.deepcopy(model).train()
+        take_indices = pruned.prune_intermediate_layers(indices, prune_norm=prune_norm)
+        features = pruned.forward_intermediates(x, indices=take_indices, norm=not prune_norm, intermediates_only=True)
+        sum(f.sum() for f in features).backward()
+        assert not [n for n, p in pruned.named_parameters() if p.grad is None]
+        # pruning an eval model must not leave (new) modules w/ dropout in train mode, outputs stay deterministic
+        pruned = copy.deepcopy(model).eval()
+        pruned.prune_intermediate_layers(indices, prune_norm=prune_norm)
+        with torch.no_grad():
+            pruned.forward_intermediates(x, indices=take_indices)
+            assert torch.equal(pruned(x), pruned(x))
+
+
+@pytest.mark.features
+def test_inception_v3_aux_logits_reset_prune() -> None:
+    """The auxiliary classifier follows reset_classifier and is pruned w/ the head."""
+    model = create_model('inception_v3', aux_logits=True).train()
+    x = torch.randn(2, 3, 299, 299)
+    model.reset_classifier(7)
+    logits, aux_logits = model(x)
+    assert logits.shape == aux_logits.shape == (2, 7)
+    model.prune_intermediate_layers([0])
+    assert model.AuxLogits is None
+    assert model(x).shape[1] == model.num_features
+
+
+@pytest.mark.features
+@pytest.mark.parametrize('model_name', ['efficientnet_b0', 'mobilenetv3_small_050'])
+def test_prune_extra_blocks_stem_width(model_name: str) -> None:
+    """Pruning to the stem (extra_blocks idx 0) sets num_features to the stem width."""
+    model = create_model(model_name)
+    model.prune_intermediate_layers([0], extra_blocks=True)
+    model.reset_classifier(7, 'avg')
+    x = torch.randn(2, 3, 64, 64)
+    assert model.forward_head(model.forward_features(x), pre_logits=True).shape[1] == model.num_features
+    assert model(x).shape == (2, 7)
+
+
+@pytest.mark.features
+@pytest.mark.parametrize('model_name', ['cait_xxs24_224', 'xcit_nano_12_p16_224', 'convit_tiny'])
+def test_prune_class_token_avg_pool(model_name: str) -> None:
+    """Average pooling covers every patch once the class token is pruned."""
+    model = create_model(model_name).eval()
+    model.prune_intermediate_layers([0])
+    model.reset_classifier(0, 'avg')
+    x = torch.randn(2, 3, 224, 224)
+    feat = model.forward_features(x)
+    assert feat.shape[1] == model.patch_embed.num_patches
+    torch.testing.assert_close(model.forward_head(feat), feat.mean(dim=1))
+    with pytest.raises(AssertionError):
+        model.reset_classifier(0, 'token')
+
+
+@pytest.mark.base
+@pytest.mark.parametrize('model_name, model_kwargs', [
+    ('resnet18', {}),
+    ('regnetx_002', {}),
+    ('convmixer_768_32', {}),
+    ('ecaresnet50d_pruned', {}),  # head width from the pruning spec
+    ('efficientnet_b0', {}),  # conv head before the pool
+    ('mobilenetv3_small_050', {}),  # conv head after the pool
+    ('ghostnet_050', {}),
+    ('convnext_atto', dict(head_hidden_size=64)),  # MLP pre-logits
+    ('caformer_s18', {}),
+    ('davit_tiny', dict(head_norm_first=True)),
+    ('edgenext_xx_small', dict(head_norm_first=True)),
+    ('rdnet_tiny', dict(head_norm_first=True)),
+    ('samvit_base_patch16', dict(img_size=64, embed_dim=64, depth=2, num_heads=2, global_attn_indexes=(1,))),  # neck
+])
+def test_head_hidden_size(model_name: str, model_kwargs: dict) -> None:
+    """head_hidden_size is the pre-logits width w/o a classifier, after reset_classifier (concat pooling) and pruning."""
+    model = create_model(model_name, num_classes=0, **model_kwargs).eval()
+    x = torch.randn(2, 3, 64, 64)
+
+    def _check_width(num_classes):
+        features = model.forward_features(x)
+        assert model.forward_head(features, pre_logits=True).shape[1] == model.head_hidden_size
+        assert model(x).shape[1] == (num_classes or model.head_hidden_size)
+
+    with torch.no_grad():
+        _check_width(0)
+        for pool in ('avg', 'catavgmax'):
+            try:
+                model.reset_classifier(7, pool)
+            except AssertionError:
+                continue  # model can't take concat pooling, see test_catavgmax_unsupported
+            _check_width(7)
+        # pruning the final stage + norm / neck, the head width falls back to the width of the tap
+        index = len(model.feature_info) - 2
+        tap_chs = model.feature_info[index]['num_chs']
+        model.prune_intermediate_layers([index], prune_norm=True)
+        model.reset_classifier(7, 'avg')
+        _check_width(7)
+        assert model.head_hidden_size == tap_chs
+
+
+@pytest.mark.base
+@pytest.mark.parametrize('pool_type', ['avg', ''])
+def test_eva_reset_classifier_removes_attention_pool(pool_type: str) -> None:
+    model = create_model('vit_pe_core_tiny_patch16_384', img_size=64).eval()
+    with torch.no_grad():
+        features = model.forward_features(torch.randn(1, 3, 64, 64))
+        pooled = model.forward_head(features, pre_logits=True)
+        model.reset_classifier(0)
+        torch.testing.assert_close(model.forward_head(features), pooled)
+        model.reset_classifier(0, pool_type)
+        expected = features[:, model.num_prefix_tokens:].mean(1) if pool_type else features
+        torch.testing.assert_close(model.forward_head(features), model.fc_norm(expected))
+    with pytest.raises(AssertionError, match='Cannot currently add attention pooling'):
+        model.reset_classifier(0, 'map')
+
+
+@pytest.mark.base
+@pytest.mark.parametrize('model_name', ['convnext_atto', 'ghostnet_050', 'beit_base_patch16_224', 'mambaout_femto'])
+def test_catavgmax_unsupported(model_name: str) -> None:
+    """Models that can't take concat pooling reject it at creation and reset instead of failing later."""
+    with pytest.raises(AssertionError):
+        create_model(model_name, global_pool='catavgmax')
+    model = create_model(model_name)
+    with pytest.raises(AssertionError):
+        model.reset_classifier(7, 'catavgmax')
+
+
+@pytest.mark.features
+@pytest.mark.parametrize('norm', [False, True])
+@pytest.mark.parametrize('prune', [False, True])
+@pytest.mark.parametrize('neck_chans', [0, 32])
+def test_samvit_feature_getter_channels(norm: bool, prune: bool, neck_chans: int) -> None:
+    from timm.models._features import FeatureGetterNet
+
+    model = create_model(
+        'samvit_base_patch16', img_size=64, embed_dim=64, depth=2, num_heads=2, global_attn_indexes=(1,),
+        neck_chans=neck_chans,
+    ).eval()
+    x = torch.randn(1, 3, 64, 64)
+    with torch.no_grad():
+        expected = model.forward_intermediates(x, indices=[0], norm=norm, intermediates_only=True)
+        getter = FeatureGetterNet(model, out_indices=(0,), norm=norm, prune=prune)
+        actual = getter(x)
+    torch.testing.assert_close(actual, expected)
+    assert getter.feature_info.channels() == [feature.shape[1] for feature in actual]
+    assert [info['num_chs'] for info in model.feature_info] == [64, 64]
+
+
+@pytest.mark.features
+@pytest.mark.parametrize('model_name', ['cspdarknet53', 'nasnetalarge'])
+def test_features_only_feature_cls_class(model_name: str) -> None:
+    """A class-valued feature_cls drops unsupported feature_cfg args (flatten_sequential, no_rewrite) like 'getter'."""
+    from timm.models._features import FeatureGetterNet
+    model = create_model(model_name, features_only=True, feature_cls=FeatureGetterNet)
+    assert isinstance(model, FeatureGetterNet)
+
+
+@pytest.mark.features
+def test_resnet_pruned_grad_checkpointing() -> None:
+    model = create_model('test_resnet').train()
+    take_indices = model.prune_intermediate_layers((0, 1, 2, 3))
+    model.set_grad_checkpointing()
+    x = torch.randn(2, 3, 64, 64)
+    final, intermediates = model.forward_intermediates(x, indices=take_indices)
+    assert len(intermediates) == 4
+    (final.sum() + model.forward_features(x).sum()).backward()
+
+
+@pytest.mark.features
+@pytest.mark.parametrize('model_name', [
+    'coat_lite_tiny', 'coat_tiny', 'hrnet_w18_small', 'nasnetalarge', 'pnasnet5large', 'legacy_xception',
+])
+def test_forward_after_prune_intermediate_layers(model_name: str) -> None:
+    """Models w/ hardcoded forward_features keep forward_features / forward usable after pruning."""
+    model = create_model(model_name, **({'img_size': 128} if model_name.startswith('coat') else {})).eval()
+    x = torch.randn(1, 3, 128, 128)
+    for index in range(len(model.feature_info)):
+        pruned = copy.deepcopy(model)
+        pruned.prune_intermediate_layers([index])
+        with torch.no_grad():
+            final, intermediates = pruned.forward_intermediates(x, indices=[index])
+            torch.testing.assert_close(pruned.forward_features(x), final, rtol=0, atol=0)
+            if not isinstance(final, list):
+                if final.shape == intermediates[0].shape:
+                    torch.testing.assert_close(final, intermediates[0], rtol=0, atol=0)  # features end at the tap
+                pruned(x)  # CoaT's multi-scale output needs the aggregate layer, removed w/ the head
+        features = pruned.train().forward_features(x)
+        sum(f.sum() for f in (features if isinstance(features, list) else [features])).backward()
+
+
+@pytest.mark.features
+@pytest.mark.parametrize('model_name,stop_early_final', [
+    ('ghostnet_050', True), ('repghostnet_050', True), ('rexnet_100', True), ('dpn48b', True),
+    ('mobilenetv3_small_050', False),
+])
+def test_prune_intermediate_layers_last_feature(model_name: str, stop_early_final: bool) -> None:
+    """Layers after the last tap (final conv / norm) are only pruned w/ the head or norm, pruned heads pool the taps."""
+    model = create_model(model_name).eval()
+    x = torch.randn(1, 3, 96, 96)
+    last = len(model.feature_info) - 1
+    with torch.no_grad():
+        expected = model(x)
+        tap = model.forward_intermediates(x, indices=[last], intermediates_only=True)[0]
+        if stop_early_final:
+            final, _ = model.forward_intermediates(x, indices=[last], stop_early=True)
+            torch.testing.assert_close(final, model.forward_features(x), rtol=0, atol=0)
+
+        pruned = copy.deepcopy(model)
+        pruned.prune_intermediate_layers([last], prune_head=False)
+        torch.testing.assert_close(pruned(x), expected, rtol=0, atol=0)
+
+        pruned = copy.deepcopy(model)
+        pruned.prune_intermediate_layers([last], prune_norm=True)
+        selected = pruned.forward_intermediates(x, indices=[last], norm=True, intermediates_only=True)
+        torch.testing.assert_close(selected[0], tap, rtol=0, atol=0)
+
+        pruned = copy.deepcopy(model)
+        pruned.prune_intermediate_layers([last - 1])
+        pruned.reset_classifier(0, 'avg')
+        torch.testing.assert_close(pruned(x), pruned.forward_features(x).mean((2, 3)))
+
+
+# NOTE: no marker, slow (prunes every model at every feature index), excluded from CI for now
+@pytest.mark.timeout(timeout360)
+@pytest.mark.parametrize('model_name', list_models(
+    module=FEAT_INTER_FILTERS,
+    exclude_filters=EXCLUDE_FILTERS + ['*huge*', '*giant*', '*gigantic*', '*_1b_*', '*_3b_*', 'xcit_large_24_p8*'],
+))
+def test_prune_intermediate_layers_contract(model_name: str) -> None:
+    """Pruned / stop_early taps match the unpruned model's, pruned models keep their output w/ the head and train."""
+    model = create_model(model_name).eval()
+    input_size = _get_input_size(model=model, target=TARGET_FFEAT_SIZE)
+    if max(input_size) > MAX_FFEAT_SIZE:
+        pytest.skip("Fixed input size model > limit.")
+    x = torch.randn((2, *input_size))
+    last = len(model.feature_info) - 1
+    # CoaT (parallel blocks), CrossViT and HRNet leave the branches that don't reach the taps unused
+    partial_branches = model_name.startswith(('coat_', 'crossvit', 'hrnet'))
+
+    with torch.no_grad():
+        expected = model(x)
+        taps = model.forward_intermediates(x, intermediates_only=True)
+        pruned = copy.deepcopy(model)
+        pruned.prune_intermediate_layers([last], prune_head=False)
+        torch.testing.assert_close(pruned(x), expected, msg='prune_head=False at the last index changed the output')
+
+    for i in range(last + 1):
+        with torch.no_grad():
+            selected = model.forward_intermediates(x, indices=[i], stop_early=True, intermediates_only=True)
+            torch.testing.assert_close(selected[0], taps[i], msg=f'stop_early tap {i}')
+
+            pruned = copy.deepcopy(model)
+            take_indices = pruned.prune_intermediate_layers([i])
+            selected = pruned.forward_intermediates(x, indices=take_indices, intermediates_only=True)
+            torch.testing.assert_close(selected[0], taps[i], msg=f'pruned tap {i}')
+
+            # w/o the norm (as features_only), the features end at the tap
+            pruned = copy.deepcopy(model)
+            take_indices = pruned.prune_intermediate_layers([i], prune_norm=True)
+            features = pruned.forward_features(x)
+            if i < last and torch.is_tensor(features) and features.ndim == 4:
+                if features.shape != taps[i].shape:
+                    features = features.permute(0, 3, 1, 2)  # NHWC
+                torch.testing.assert_close(features, taps[i], msg=f'pruned features {i}')
+
+        pruned.train()
+        selected = pruned.forward_intermediates(x, indices=take_indices, intermediates_only=True)
+        features = pruned.forward_features(x)
+        features = features if isinstance(features, (list, tuple)) else [features]
+        sum(f.sum() for f in selected + features).backward()
+        if not partial_branches:
+            unused = [n for n, p in pruned.named_parameters() if p.requires_grad and p.grad is None]
+            assert not unused, f'pruned to {i}, unused params: {unused}'
+
+
+@pytest.mark.features
+@pytest.mark.parametrize('model_name', ['resnetv2_18', 'legacy_seresnet18', 'cspresnet50'])
+def test_prune_to_stem_feature(model_name: str) -> None:
+    """Pruning to the stem tap removes the stem pooling that follows it, forward_features is the stem feature."""
+    model = create_model(model_name).eval()
+    x = torch.randn(1, 3, 64, 64)
+    with torch.no_grad():
+        expected = model.forward_intermediates(x, indices=[0], intermediates_only=True)[0]
+        model.prune_intermediate_layers([0])
+        torch.testing.assert_close(model.forward_features(x), expected, rtol=0, atol=0)
+
+
+@pytest.mark.features
+@pytest.mark.parametrize('model_name,model_kwargs', [
+    ('twins_svt_small', dict(embed_dims=(16, 32, 64, 128), num_heads=(1, 1, 1, 1), depths=(1, 1, 1, 1))),
+    ('swin_tiny_patch4_window7_224', dict(embed_dim=16, depths=(1, 1, 1, 1), num_heads=(1, 1, 1, 1))),
+    ('swinv2_tiny_window8_256', dict(embed_dim=16, depths=(1, 1, 1, 1), num_heads=(1, 1, 1, 1))),
+    ('volo_d1_224', dict()),
+])
+def test_forward_intermediates_stop_early_final_norm(model_name: str, model_kwargs: dict) -> None:
+    """Stopping early skips the final norm (and post network), they only follow the last stage."""
+    model = create_model(model_name, **model_kwargs).eval()
+    x = torch.randn(1, 3, *model.pretrained_cfg['input_size'][-2:])
+    with torch.no_grad():
+        _, intermediates = model.forward_intermediates(x)
+        for norm in (False, True):
+            _, selected = model.forward_intermediates(x, indices=[0], norm=norm, stop_early=True)
+            torch.testing.assert_close(selected[0], intermediates[0], rtol=0, atol=0)
+
+
+@pytest.mark.features
+@pytest.mark.parametrize('model_name,model_kwargs', [
+    ('resnetv2_18', dict()),
+    ('resnetv2_18', dict(stem_type='fixed')),
+    ('resnetv2_50', dict(stem_type='deep', preact=False)),
+])
+def test_resnetv2_stem_feature_odd_size(model_name: str, model_kwargs: dict) -> None:
+    """The stem feature is taken from its module, odd input sizes round the stride 2 conv output up."""
+    model = create_model(model_name, **model_kwargs).eval()
+    stem_feat = {}
+    model.get_submodule(model.feature_info[0]['module']).register_forward_hook(
+        lambda m, i, o: stem_feat.setdefault('out', o))
+    x = torch.randn(1, 3, 65, 67)
+    with torch.no_grad():
+        output, intermediates = model.forward_intermediates(x)
+    assert intermediates[0].shape[-2:] == (33, 34)
+    torch.testing.assert_close(intermediates[0], stem_feat['out'], rtol=0, atol=0)
+    torch.testing.assert_close(output, model.forward_features(x))
+
+
+@pytest.mark.features
+@pytest.mark.parametrize('stem_type', ['deep', 'deep_quad'])
+def test_nfnet_stem_feature_consistency(stem_type: str) -> None:
+    from timm.models._features import FeatureListNet
+
+    model = create_model('test_nfnet', stem_type=stem_type).eval()
+    x = torch.randn(1, 3, 64, 64)
+    stem_only = FeatureListNet(model, out_indices=(0,), flatten_sequential=True)
+    features = FeatureListNet(model, out_indices=(0, 1, 2, 3, 4), flatten_sequential=True)
+    with torch.no_grad():
+        expected = stem_only(x)[0]
+        # Continuing past the stem tap must not modify its captured output.
+        torch.testing.assert_close(features(x)[0], expected, rtol=0, atol=0)
+        _, intermediates = model.forward_intermediates(x)
+        torch.testing.assert_close(intermediates[0], expected, rtol=0, atol=0)
+        selected = model.forward_intermediates(x, indices=[0], stop_early=True, intermediates_only=True)
+        torch.testing.assert_close(selected[0], expected, rtol=0, atol=0)
+
+
+@pytest.mark.features
+@pytest.mark.parametrize('use_msfa', [True, False])
+@pytest.mark.parametrize('indices', [None, [0], [-1]])
+def test_mobilenetv5_intermediate_final_features(use_msfa, indices):
+    model = create_model(
+        'mobilenetv5_base', channel_multiplier=0.125, num_features=64,
+        msfa_output_resolution=4, num_classes=7, use_msfa=use_msfa,
+    ).eval()
+    x = torch.randn(2, 3, 96, 128)
+    with torch.no_grad():
+        output, intermediates = model.forward_intermediates(x, indices=indices)
+        torch.testing.assert_close(output, model.forward_features(x))
+        torch.testing.assert_close(model.forward_head(output), model(x))
+        selected = model.forward_intermediates(x, indices=indices, intermediates_only=True)
+        for actual, expected in zip(intermediates, selected):
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 def _create_fx_model(model, train=False):
@@ -694,7 +1320,7 @@ def test_model_forward_fx(model_name, batch_size):
         if isinstance(fx_outputs, tuple):
             fx_outputs = torch.cat(fx_outputs)
 
-    assert torch.all(fx_outputs == outputs)
+    torch.testing.assert_close(fx_outputs, outputs, rtol=1e-4, atol=1e-5)
     assert outputs.shape[0] == batch_size
     assert not torch.isnan(outputs).any(), 'Output included NaNs'
 
@@ -714,6 +1340,11 @@ def test_model_backward_fx(model_name, batch_size):
         pytest.skip("Fixed input size model > limit.")
 
     model = create_model(model_name, pretrained=False, num_classes=42)
+    encoder_only = model.num_classes == 0
+    feat_axis = getattr(model, 'feature_dim', None) if encoder_only else -1
+    if feat_axis is None:
+        feat_axis = get_channel_dim(getattr(model, 'output_fmt', 'NCHW'))
+    output_features = (getattr(model, 'out_features', None) or model.num_features) if encoder_only else 42
     model.train()
     num_params = sum([x.numel() for x in model.parameters()])
     if 'GITHUB_ACTIONS' in os.environ and num_params > 100e6:
@@ -728,7 +1359,7 @@ def test_model_backward_fx(model_name, batch_size):
         assert x.grad is not None, f'No gradient for {n}'
     num_grad = sum([x.grad.numel() for x in model.parameters() if x.grad is not None])
 
-    assert outputs.shape[-1] == 42
+    assert outputs.shape[feat_axis] == output_features
     assert num_params == num_grad, 'Some parameters are missing gradients'
     assert not torch.isnan(outputs).any(), 'Output included NaNs'
 
@@ -917,6 +1548,7 @@ def test_naflexvit_direct_grid_sample_export(ar_preserving):
     assert actual[1] == expected[1]
 
 
+@pytest.mark.base
 def test_naflexvit_forward_intermediates_dict_input():
     """NaFlex (pre-patchified dict) inputs through forward_intermediates: NLC-only, final-feature
     parity with forward_features, patch_valid surfaced for downstream masking/scatter."""
@@ -952,6 +1584,33 @@ def test_naflexvit_forward_intermediates_dict_input():
     model_pd.train()
     with pytest.raises(ValueError, match='patch dropout'):
         model_pd.forward_intermediates(batch, output_fmt='NLC')
+
+
+@pytest.mark.base
+def test_naflexvit_mixed_rope_dict_input():
+    """NaFlex (pre-patchified dict) input with mixed (per-depth) RoPE: the batched per-depth rope iterator must
+    produce the same result as running each sample alone."""
+    model = create_model('naflexvit_base_patch16_gap', embed_dim=64, depth=2, num_heads=2, rope_type='mixed')
+    model.eval()
+    n = 8 * 8
+    patches = torch.randn(2, n, 16 * 16 * 3)
+    coord = torch.zeros(2, n, 2, dtype=torch.long)
+    coord[0, :, 0] = torch.arange(n) // 8
+    coord[0, :, 1] = torch.arange(n) % 8
+    n2 = 6 * 10
+    coord[1, :n2, 0] = torch.arange(n2) // 10
+    coord[1, :n2, 1] = torch.arange(n2) % 10
+    valid = torch.zeros(2, n, dtype=torch.bool)
+    valid[0] = True
+    valid[1, :n2] = True
+    batch = {'patches': patches, 'patch_coord': coord, 'patch_valid': valid}
+
+    with torch.no_grad():
+        out = model(batch)
+        assert out.shape == (2, model.num_classes) and torch.isfinite(out).all()
+        for i in range(2):
+            single = {k: v[i:i + 1] for k, v in batch.items()}
+            torch.testing.assert_close(model(single), out[i:i + 1], atol=1e-5, rtol=1e-5)
 
 
 @pytest.mark.base
@@ -1051,8 +1710,122 @@ def test_naflexvit_key_only_attn_mask_output_parity(global_pool):
         full_out = full_model(patches, patch_coord=coord, patch_valid=valid)
         compact_out = compact_model(patches, patch_coord=coord, patch_valid=valid)
 
-    assert torch.equal(full_out, compact_out)
+    torch.testing.assert_close(compact_out, full_out, rtol=1e-4, atol=1e-5)
 
+
+@pytest.mark.base
+@pytest.mark.parametrize('model_name,use_naflex', [
+    ('naflexvit_base_patch16_radio_v3', None),
+    ('vit_base_patch16_radio_v3', False),
+    ('vit_base_patch16_radio_v3', True),
+])
+@pytest.mark.parametrize('grid_size', [(3, 5), (16, 64)])  # (16, 64) has the token count of the 512px default
+def test_radio_checkpoint_filter(model_name, use_naflex, grid_size, tmp_path):
+    """RADIO backbone keys remap and load strictly, embeds match RADIO's bias-free (C, ph, pw) patch linear
+    and its eval-mode pos embed (bilinear, no antialias, resize to square of max grid dim then crop top-left).
+    NaFlexVit keeps the full 128x128 grid, ViT resamples it once at load for its fixed img_size.
+    """
+    D, num_tokens = 32, 8
+    gh, gw = grid_size
+    model_kwargs = dict(embed_dim=D, depth=1, num_heads=2, img_size=(gh * 16, gw * 16))
+    if use_naflex is not None:
+        model_kwargs['use_naflex'] = use_naflex
+    is_naflex = model_name.startswith('naflexvit') or use_naflex
+    model = create_model(model_name, **model_kwargs)
+    radio_sd = {
+        'radio_model.input_conditioner.norm_mean': torch.zeros(3, 1, 1),
+        'radio_model.summary_idxs': torch.tensor([0, 1, 2]),
+        'radio_model.model.patch_generator.embedder.weight': torch.randn(D, 3 * 16 * 16),
+        'radio_model.model.patch_generator.pos_embed': torch.randn(1, 128 * 128, D),
+        'radio_model.model.patch_generator.cls_token.token': torch.randn(num_tokens, D),
+    }
+    for k, v in model.blocks.state_dict().items():
+        radio_sd['radio_model.model.blocks.' + k.replace('.gamma', '.grandma')] = torch.randn_like(v)
+    torch.save(radio_sd, tmp_path / 'radio.pth')
+    model = create_model(
+        model_name,
+        pretrained=True,
+        pretrained_cfg_overlay=dict(file=str(tmp_path / 'radio.pth')),
+        **model_kwargs,
+    ).eval()
+    assert model.num_prefix_tokens == num_tokens
+
+    x = torch.randn(2, 3, gh * 16, gw * 16)
+    patches = x.reshape(2, 3, gh, 16, gw, 16).permute(0, 2, 4, 1, 3, 5).reshape(2, gh * gw, -1)
+    expected = patches @ radio_sd['radio_model.model.patch_generator.embedder.weight'].t()
+    pos_embed = radio_sd['radio_model.model.patch_generator.pos_embed'].reshape(1, 128, 128, D).permute(0, 3, 1, 2)
+    # C-RADIOv3 release behaviour is align_corners=True
+    pos_embed = torch.nn.functional.interpolate(pos_embed, size=(gw, gw), mode='bilinear', align_corners=True)
+    pos_embed = pos_embed[:, :, :gh, :gw]
+    expected = expected + pos_embed.flatten(2).transpose(1, 2)
+    expected = torch.cat([radio_sd['radio_model.model.patch_generator.cls_token.token'].expand(2, -1, -1), expected], 1)
+    with torch.no_grad():
+        if is_naflex:
+            actual, _ = model.embeds(x)
+        else:
+            actual = model._pos_embed(model.patch_embed(x))
+    torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-4)
+
+    if is_naflex:
+        # NaFlex pre-patchified input w/ grid_sample pos embed must match
+        from timm.models.naflexvit import batch_patchify
+        patches, _ = batch_patchify(x, (16, 16))
+        patch_coord = torch.cartesian_prod(torch.arange(gh), torch.arange(gw)).expand(2, -1, -1)
+        model.embeds.pos_embed_use_grid_sample = True
+        with torch.no_grad():
+            actual, _ = model.embeds(patches, patch_coord=patch_coord)
+        torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-4)
+
+
+@pytest.mark.base
+@pytest.mark.parametrize('num_kv_heads', [4, 2, (4, 2, 4)])
+@pytest.mark.parametrize('attn_only_layer_scale', [False, True])
+def test_naflexvit_sapiens2_conversion(num_kv_heads, attn_only_layer_scale):
+    from timm.models.naflexvit import batch_patchify, checkpoint_filter_fn
+
+    common_kwargs = dict(
+        img_size=(32, 48), patch_size=8, embed_dim=32, depth=3, num_heads=4,
+        num_kv_heads=num_kv_heads, num_classes=0, attn_only_layer_scale=attn_only_layer_scale,
+        rope_shift_coords=0.1, rope_jitter_coords=1.1, rope_grid_offset=0.25,
+    )
+    eva = create_model('vit_base_patch16_sapiens2', use_naflex=False, **common_kwargs)
+    naflex = create_model('vit_base_patch16_sapiens2', use_naflex=True, **common_kwargs)
+    naflex.load_state_dict(checkpoint_filter_fn(eva.state_dict(), naflex), strict=True)
+
+    images = torch.randn(2, 3, 32, 48)
+    patches, grid = batch_patchify(images, (8, 8))
+    coord = torch.stack(torch.meshgrid(torch.arange(grid[0]), torch.arange(grid[1]), indexing='ij'), dim=-1)
+    coord = coord.reshape(1, -1, 2).expand(images.shape[0], -1, -1)
+    valid = torch.ones(patches.shape[:2], dtype=torch.bool)
+    # Include padding to exercise NaFlex attention masking with grouped KV heads.
+    patches = torch.nn.functional.pad(patches, (0, 0, 0, 3))
+    coord = torch.nn.functional.pad(coord, (0, 0, 0, 3))
+    valid = torch.nn.functional.pad(valid, (0, 3))
+
+    for training in (False, True):
+        eva.train(training)
+        naflex.train(training)
+        # Match train-time coordinate augmentation draws across the three input paths.
+        torch.manual_seed(123)
+        reference = eva.forward_features(images)
+        torch.manual_seed(123)
+        actual_images = naflex.forward_features(images)
+        torch.manual_seed(123)
+        actual_patches = naflex.forward_features(patches, patch_coord=coord, patch_valid=valid)['patches']
+        actual_patches = actual_patches[:, :reference.shape[1]]
+        torch.testing.assert_close(actual_images, reference, rtol=2e-5, atol=2e-6)
+        torch.testing.assert_close(actual_patches, reference, rtol=2e-5, atol=2e-6)
+
+        if training:
+            loss_weight = torch.randn_like(reference)
+            (reference * loss_weight).mean().backward()
+            (actual_patches * loss_weight).mean().backward()
+            reference_grads = checkpoint_filter_fn({k: p.grad for k, p in eva.named_parameters()}, naflex)
+            for name, parameter in naflex.named_parameters():
+                torch.testing.assert_close(parameter.grad, reference_grads[name], rtol=2e-4, atol=2e-6)
+
+
+@pytest.mark.base
 def test_gemma4_forward_intermediates_dict_output():
     """gemma4_vit dict-output intermediates match the NaFlexVit contract (API symmetry):
     'image_intermediates' / 'image_features' / 'patch_valid' aligned with the token sequence."""
@@ -1076,3 +1849,791 @@ def test_gemma4_forward_intermediates_dict_output():
     assert torch.equal(out['patch_valid'], valid)
     assert torch.allclose(out['image_features'], final)
     assert len(out['image_intermediates']) == len(inter)
+
+
+@pytest.mark.base
+@pytest.mark.parametrize('model_name,encoder_pool', [
+    ('gemma4_vit_167m', ''),
+    ('gemma4_vit_167m', 'soft'),
+    ('qwen3_vit_88m', ''),
+    ('qwen3_vit_88m_merge', 'merge'),
+    ('deepseek_vit_412m', ''),
+    ('deepseek_vit_412m_align', 'align'),
+])
+def test_vit_classifier_encoder_hooks(model_name, encoder_pool):
+    kwargs = dict(num_classes=5, embed_dim=32, depth=1, num_heads=2, encoder_pool=encoder_pool)
+    if model_name.startswith('gemma4'):
+        kwargs.update(head_dim=16, intermediate_size=64, position_embedding_size=16, pooling_kernel_size=2)
+    elif model_name.startswith('deepseek'):
+        kwargs.update(patch_size=8, out_features=48)
+    model = create_model(model_name, **kwargs).eval()
+    events = []
+    model.encoder.register_forward_pre_hook(lambda *args: events.append('encoder_pre'))
+    model.encoder.register_forward_hook(lambda *args: events.append('encoder_post'))
+    if encoder_pool in ('merge', 'align'):
+        projector = model.encoder.merger if encoder_pool == 'merge' else model.encoder.aligner
+        projector.fc2.register_forward_hook(lambda *args: events.append('fc2_post'))
+        projector.register_forward_hook(lambda *args: events.append('projector_post'))
+    with torch.no_grad():
+        output = model(torch.randn(2, 3, 64, 96))
+    if encoder_pool in ('merge', 'align'):
+        expected_events = ['encoder_pre', 'fc2_post', 'projector_post', 'encoder_post']
+    else:
+        expected_events = ['encoder_pre', 'encoder_post']
+    assert events == expected_events
+    assert output.shape == (2, 5)
+
+
+@pytest.mark.base
+@pytest.mark.parametrize('model_name, kwargs', [
+    ('qwen3_vit_88m_merge', dict(embed_dim=32, depth=1, num_heads=4, pos_embed_grid_size=4)),
+    ('deepseek_vit_412m_align', dict(embed_dim=32, depth=1, num_heads=4, patch_size=8, out_features=48)),
+    ('iformer_t', dict(dims=(16, 24, 32, 48), depths=(1, 1, 3, 3), attn_groups=(0, 0, 1, 1),
+                       layer_scale_init_value=1e-6)),
+    ('efficientvim_m1_dist', dict(embed_dim=(16, 24, 32), depths=(1, 1, 1), state_dim=(4, 4, 4))),
+])
+def test_model_init_weights_after_to_empty(model_name, kwargs):
+    if not hasattr(torch.nn.Module, 'to_empty'):
+        pytest.skip('to_empty requires a newer PyTorch version')
+    model = create_model(
+        model_name, device='meta', dtype=torch.float64, num_classes=5, **kwargs,
+    )
+    assert all(p.device.type == 'meta' and p.dtype == torch.float64 for p in model.parameters())
+    model = model.to_empty(device='cpu').eval()
+    # Poison storage so missed resets cannot pass just because uninitialized values happen to be finite.
+    with torch.no_grad():
+        for tensor in list(model.parameters()) + list(model.buffers()):
+            if tensor.is_floating_point():
+                tensor.fill_(float('nan'))
+    model.init_weights()
+    for name, tensor in list(model.named_parameters()) + list(model.named_buffers()):
+        assert torch.isfinite(tensor).all(), name
+    if model_name.startswith('qwen'):
+        torch.testing.assert_close(model.encoder.blocks[0].norm1.weight, torch.ones(32, dtype=torch.float64))
+    assert torch.isfinite(model(torch.randn(1, 3, 64, 64, dtype=torch.float64))).all()
+
+
+_VIT_ENCODER_CASES = [
+    (
+        'gemma4_vit_167m',
+        'soft',
+        'pooler.',
+        dict(
+            head_dim=8,
+            intermediate_size=64,
+            position_embedding_size=16,
+            pooling_kernel_size=2,
+        ),
+    ),
+    ('qwen3_vit_88m', 'merge', 'merger.', dict(out_features=48, pos_embed_grid_size=4)),
+    ('deepseek_vit_412m', 'align', 'aligner.', dict(out_features=48)),
+]
+
+
+@pytest.mark.base
+@pytest.mark.parametrize('model_name, pool, pool_prefix, model_kwargs', _VIT_ENCODER_CASES)
+@pytest.mark.parametrize('use_pool', [False, True])
+def test_vit_classifier_checkpoint(model_name, pool, pool_prefix, model_kwargs, use_pool):
+    kwargs = dict(embed_dim=32, depth=2, num_heads=4, patch_size=8, **model_kwargs)
+    encoder = create_model(model_name + '_enc', global_pool=pool, **kwargs)
+    model = create_model(model_name, num_classes=5, encoder_pool=pool if use_pool else '', **kwargs)
+    filter_fn = importlib.import_module(type(model).__module__).checkpoint_filter_fn_classifier
+    # Different values, including norms, ensure missing loads cannot match default initialization.
+    with torch.no_grad():
+        for parameter in encoder.parameters():
+            parameter.uniform_(-0.5, 0.5)
+    encoder_state = encoder.state_dict()
+    state = filter_fn(encoder_state, model)
+    result = model.load_state_dict(state, strict=False)
+    assert set(result.missing_keys) == {'head.weight', 'head.bias'}
+    assert not result.unexpected_keys
+    expected = {k: v for k, v in encoder_state.items() if use_pool or not k.startswith(pool_prefix)}
+    torch.testing.assert_close(model.encoder.state_dict(), expected)
+    # Native classifier checkpoints retain encoder parameters and their separately named head.
+    torch.testing.assert_close(filter_fn(model.state_dict(), model), model.state_dict())
+    if model_name.startswith('deepseek'):
+        # DeepSeek's bare norm/head belong to the LLM when a vision namespace is present.
+        source = {k if k.startswith(pool_prefix) else f'vision.{k}': v for k, v in encoder_state.items()}
+        source.update({'norm.weight': torch.ones(64), 'head.weight': torch.ones(64, 64)})
+        state = filter_fn(source, model)
+        result = model.load_state_dict(state, strict=False)
+        assert set(result.missing_keys) == {'head.weight', 'head.bias'}
+        assert not result.unexpected_keys
+
+
+@pytest.mark.base
+@pytest.mark.parametrize('model_name, pool, pool_prefix, model_kwargs', _VIT_ENCODER_CASES)
+def test_vit_classifier_pruned_features(model_name, pool, pool_prefix, model_kwargs):
+    from timm.models._features import FeatureGetterNet
+
+    model = create_model(
+        model_name,
+        embed_dim=32,
+        depth=2,
+        num_heads=4,
+        patch_size=8,
+        num_classes=5,
+        encoder_pool=pool,
+        **model_kwargs,
+    ).eval()
+    x = torch.randn(2, 3, 64, 96)
+    with torch.no_grad():
+        expected = model.forward_intermediates(x, indices=[0], norm=True, intermediates_only=True)
+    getter = FeatureGetterNet(model, out_indices=[0], norm=True)
+    torch.testing.assert_close(getter(x), expected)
+    assert not any(n.startswith(pool_prefix) for n, _ in model.encoder.named_parameters())
+    assert len(model.encoder.blocks) == len(getter.feature_info.channels()) == 1
+    sum(t.square().mean() for t in getter(x)).backward()
+    for name, parameter in getter.named_parameters():
+        if parameter.requires_grad:
+            assert parameter.grad is not None, f'No gradient for {name}'
+    if not any(fnmatch.fnmatch(model_name, pattern) for pattern in EXCLUDE_JIT_FILTERS):
+        torch.testing.assert_close(torch.jit.script(getter)(x), expected)
+    model.reset_classifier(5)
+    assert model(x).shape == (2, 5)
+
+
+@pytest.mark.base
+@pytest.mark.parametrize('model_name', ['efficientvim_m1', 'efficientvim_m1_dist'])
+def test_efficientvim_branch_features(model_name):
+    model = create_model(
+        model_name, num_classes=5, embed_dim=(16, 24, 32), depths=(1, 1, 1), state_dim=(4, 4, 4),
+    ).eval()
+    x = torch.randn(2, 3, 64, 96)
+    with torch.no_grad():
+        features = model.forward_features(x)
+        assert [t.shape[1] for t in features] == [16, 24, 32, 32]
+        torch.testing.assert_close(model(x), model.forward_head(features))
+        pre_logits = model.forward_head(features, pre_logits=True)
+        assert pre_logits.shape == (2, model.head_hidden_size)
+        expected = model.forward_intermediates(x, indices=[0, 1], norm=True, intermediates_only=True)
+        model.prune_intermediate_layers([0, 1])
+        actual = model.forward_intermediates(x, norm=True, intermediates_only=True)
+        torch.testing.assert_close(actual, expected)
+        assert model(x).shape == (2, model.num_features)
+
+
+@pytest.mark.base
+@pytest.mark.parametrize('model_name, kwargs', [
+    ('efficientvim_m1', dict(embed_dim=(16, 24, 32), depths=(1, 1, 1), state_dim=(4, 4, 4))),
+    ('efficientvim_m1_dist', dict(embed_dim=(16, 24, 32), depths=(1, 1, 1), state_dim=(4, 4, 4))),
+    ('iformer_t', dict(dims=(16, 24, 32, 48), depths=(1, 1, 3, 3), attn_groups=(0, 0, 1, 1))),
+    ('repvit_m0_9', {}),
+    ('shvit_s1', {}),
+])
+def test_mobile_model_fusion_features(model_name, kwargs):
+    from copy import deepcopy
+    from timm.models._features import FeatureGetterNet
+    from timm.utils import reparameterize_model
+
+    model = create_model(model_name, num_classes=5, **kwargs).eval()
+    # Exercise learned BN statistics and nonuniform gates, not just their initial values.
+    for module in model.modules():
+        if isinstance(module, torch.nn.modules.batchnorm._BatchNorm):
+            torch.nn.init.uniform_(module.running_mean, -0.2, 0.2)
+            torch.nn.init.uniform_(module.running_var, 0.5, 1.5)
+            torch.nn.init.uniform_(module.weight, 0.5, 1.5)
+            torch.nn.init.uniform_(module.bias, -0.2, 0.2)
+        if hasattr(module, 'alpha'):
+            torch.nn.init.uniform_(module.alpha, -1, 1)
+    x = torch.randn(2, 3, 64, 96)
+    fused = reparameterize_model(model)
+    assert any(isinstance(m, torch.nn.modules.batchnorm._BatchNorm) for m in model.modules())
+    assert not any(isinstance(m, torch.nn.modules.batchnorm._BatchNorm) for m in fused.modules())
+    with torch.no_grad():
+        torch.testing.assert_close(fused(x), model(x), atol=2e-5, rtol=2e-5)
+        torch.testing.assert_close(reparameterize_model(fused)(x), fused(x), atol=0, rtol=0)
+    for norm, indices in [(False, [0, 1]), (True, [0, -1])]:
+        expected = model.forward_intermediates(x, indices=indices, norm=norm, intermediates_only=True)
+        getter = FeatureGetterNet(deepcopy(model), out_indices=indices, norm=norm).eval()
+        torch.testing.assert_close(getter(x), expected)
+        fused_getter = reparameterize_model(getter)
+        torch.testing.assert_close(fused_getter(x), expected, atol=2e-5, rtol=2e-5)
+        torch.testing.assert_close(torch.jit.script(fused_getter)(x), fused_getter(x))
+        getter.train()
+        sum(t.square().mean() for t in getter(x)).backward()
+        assert all(p.grad is not None for p in getter.parameters() if p.requires_grad)
+        # Resetting a classifier after pruning must use the retained feature width.
+        getter.model.reset_classifier(7, global_pool='avg')
+        assert getter.model(x).shape == (2, 7)
+
+
+_SWIN_FAMILY = [
+    ('swin_tiny_patch4_window7_224', 224),
+    ('swinv2_tiny_window8_256', 256),
+    ('swinv2_cr_tiny_224', 224),
+]
+_SWIN_KWARGS = dict(embed_dim=16, depths=(2, 2, 2, 2), num_heads=(1, 1, 1, 1), num_classes=5)
+
+
+def _swin_blocks(model):
+    stages = model.layers if hasattr(model, 'layers') else model.stages
+    return [b for s in stages for b in s.blocks]
+
+
+@pytest.mark.base
+@pytest.mark.parametrize('model_name,img_size', _SWIN_FAMILY)
+def test_swin_family_reinit_after_to_empty(model_name, img_size):
+    from timm.models._manipulate import reinit_non_persistent_buffers
+
+    model = create_model(model_name, **_SWIN_KWARGS).eval()
+    meta_model = create_model(model_name, device='meta', **_SWIN_KWARGS).to_empty(device='cpu').eval()
+    # Poison storage so a buffer that is never recomputed cannot pass by chance.
+    with torch.no_grad():
+        for tensor in meta_model.buffers():
+            if tensor.is_floating_point():
+                tensor.fill_(float('nan'))
+    meta_model.load_state_dict(model.state_dict())
+    reinit_non_persistent_buffers(meta_model)
+    x = torch.randn(1, 3, img_size, img_size)
+    with torch.no_grad():
+        torch.testing.assert_close(meta_model(x), model(x))
+
+
+@pytest.mark.base
+@pytest.mark.parametrize('model_name,img_size', _SWIN_FAMILY)
+def test_swin_family_set_input_size(model_name, img_size):
+    new_size = (img_size * 2, img_size * 2)
+    new_window = img_size * 2 // 32
+    # resize a model that has already been cast, the recomputed buffers / params must follow the model dtype
+    model = create_model(model_name, **_SWIN_KWARGS).to(torch.bfloat16).eval()
+    model.set_input_size(img_size=new_size, window_size=new_window)
+    for name, buf in model.named_buffers():
+        if name.endswith('attn_mask'):
+            assert buf.dtype == torch.bfloat16, name
+    # compare outputs in float32 against a model created at the new size (bf16 forward is covered by dtype check)
+    model = model.float()
+    expected = create_model(model_name, img_size=new_size, window_size=new_window, **_SWIN_KWARGS).eval()
+    expected.load_state_dict(model.state_dict())
+    x = torch.randn(1, 3, *new_size)
+    with torch.no_grad():
+        torch.testing.assert_close(model(x), expected(x))
+
+    # window size only, feat size (last stage) now exceeds window so shifted blocks gain a mask
+    model.set_input_size(window_size=4)
+    assert all(b.window_size == (4, 4) for b in _swin_blocks(model))
+    with torch.no_grad():
+        model(x)
+
+    # always_partition forces shifting even when the window covers the whole feature map
+    model = create_model(model_name, **_SWIN_KWARGS).eval()
+    assert not any(_swin_blocks(model)[-1].shift_size)
+    model.set_input_size(img_size=(img_size, img_size), always_partition=True)
+    assert any(_swin_blocks(model)[-1].shift_size)
+    with torch.no_grad():
+        model(torch.randn(1, 3, img_size, img_size))
+
+
+def _swin_window_spec(spec, w):
+    # window size specs relative to the default window w (grid // 8) at the base img size
+    return {
+        'default': None,
+        'uniform': 2 * w,  # one window for all stages that is not grid // 8
+        'per_stage': (w, w, 2 * w, w),  # Swin S3 style
+        'non_square': ((w, 4), (2 * w, w), (w, 2 * w), (w, w)),
+    }[spec]
+
+
+def _scale_window_spec(window_size, scale):
+    if isinstance(window_size, int):
+        return window_size * scale
+    return tuple([_scale_window_spec(w, scale) for w in window_size])
+
+
+def _assert_swin_stage_windows(model, window_size):
+    from timm.models.swin_transformer import resolve_stage_window_sizes
+    stages = model.layers if hasattr(model, 'layers') else model.stages
+    for stage, ws in zip(stages, resolve_stage_window_sizes(window_size, len(stages))):
+        for b in stage.blocks:
+            feat_size = b.feat_size if hasattr(b, 'feat_size') else b.input_resolution
+            # windows are clamped to the feature size when not always partitioning
+            assert b.window_size == tuple([min(w, f) for w, f in zip(ws, feat_size)])
+
+
+def _swin_structure(model):
+    blocks = _swin_blocks(model)
+    return [(b.window_size, b.shift_size) for b in blocks], {k: v.shape for k, v in model.state_dict().items()}
+
+
+def _create_swin(model_name, **kwargs):
+    model = create_model(model_name, **dict(_SWIN_KWARGS, **kwargs)).eval()
+    with torch.no_grad():
+        # SwinV2 zero inits the res-post-norm weights, which would hide attention / window changes in the output
+        for n, p in model.named_parameters():
+            if 'norm' in n and n.endswith('weight'):
+                p.fill_(1.)
+    return model
+
+
+@pytest.mark.base
+@pytest.mark.parametrize('spec', ['default', 'uniform', 'per_stage', 'non_square'])
+@pytest.mark.parametrize('model_name,img_size', _SWIN_FAMILY)
+def test_swin_family_set_input_size_stage_windows(model_name, img_size, spec):
+    window_size = _swin_window_spec(spec, img_size // 32)
+    model = _create_swin(model_name, **(dict(window_size=window_size) if window_size is not None else {}))
+    _assert_swin_stage_windows(model, window_size if window_size is not None else img_size // 32)
+    x = torch.randn(1, 3, img_size, img_size)
+    state = {k: v.clone() for k, v in model.state_dict().items()}
+    structure = _swin_structure(model)
+    with torch.no_grad():
+        expected = model(x)
+
+    # calls at the current size must not change the model
+    for kw in (dict(), dict(img_size=(img_size, img_size))):
+        model.set_input_size(**kw)
+        assert _swin_structure(model) == structure
+        for k, v in model.state_dict().items():
+            assert torch.equal(v, state[k]), k
+        with torch.no_grad():
+            torch.testing.assert_close(model(x), expected, rtol=0, atol=0)
+
+    # a resize scales every stage's window with the grid, matching a model created at that size w/ scaled windows
+    new_size = (img_size * 2, img_size * 2)
+    model.set_input_size(img_size=new_size)
+    ref_window_size = _scale_window_spec(window_size if window_size is not None else img_size // 32, 2)
+    ref = _create_swin(model_name, img_size=new_size, window_size=ref_window_size)
+    _assert_swin_stage_windows(model, ref_window_size)
+    assert _swin_structure(model) == _swin_structure(ref)
+    ref.load_state_dict(model.state_dict())
+    x_new = torch.randn(1, 3, *new_size)
+    with torch.no_grad():
+        torch.testing.assert_close(model(x_new), ref(x_new))
+
+    # and back again restores the original windows
+    model.set_input_size(img_size=(img_size, img_size))
+    assert _swin_structure(model) == structure
+
+    # explicit per-stage window sizes are applied as given and become the reference for later calls
+    stage_windows = _scale_window_spec(_swin_window_spec('per_stage', img_size // 32), 2)
+    model.set_input_size(img_size=new_size, window_size=stage_windows)
+    _assert_swin_stage_windows(model, stage_windows)
+    ref = _create_swin(model_name, img_size=new_size, window_size=stage_windows)
+    assert _swin_structure(model) == _swin_structure(ref)
+    model.set_input_size()
+    assert _swin_structure(model) == _swin_structure(ref)
+
+    # window_ratio keeps the legacy behaviour of one grid // window_ratio window for all stages
+    model.set_input_size(img_size=(img_size, img_size), window_ratio=8)
+    ref = _create_swin(model_name, window_size=img_size // 32)
+    assert _swin_structure(model) == _swin_structure(ref)
+
+
+@pytest.mark.base
+@pytest.mark.parametrize('model_name', [m for m, _ in _SWIN_FAMILY])
+def test_swin_family_set_input_size_window_ratios(model_name):
+    windows = ((8, 10), (8, 10), (16, 20), (8, 10))
+    for window_ratio in [(8, 8, 4, 8), [8, 8, 4, 8]]:
+        model = _create_swin(model_name)
+        model.set_input_size(img_size=(256, 320), window_ratio=window_ratio)
+        _assert_swin_stage_windows(model, windows)
+        # ratios divide the new patch grid and become the reference for later resizes
+        for size, size_windows in [((256, 320), windows), ((320, 256), ((10, 8), (10, 8), (20, 16), (10, 8)))]:
+            model.set_input_size(img_size=size)
+            ref = _create_swin(model_name, img_size=size, window_size=size_windows)
+            assert _swin_structure(model) == _swin_structure(ref)
+            ref.load_state_dict(model.state_dict())
+            x = torch.randn(1, 3, *size)
+            with torch.no_grad():
+                torch.testing.assert_close(model(x), ref(x))
+
+        # an explicit window size overrides the ratio
+        model.set_input_size(window_size=4, window_ratio=window_ratio)
+        _assert_swin_stage_windows(model, 4)
+
+        if model_name.startswith('swinv2_cr'):
+            # V2-CR also takes window ratios in the constructor
+            model = _create_swin(model_name, img_size=(256, 320), window_ratio=window_ratio)
+            _assert_swin_stage_windows(model, windows)
+            structure = _swin_structure(model)
+            model.set_input_size()
+            assert _swin_structure(model) == structure
+            _assert_swin_stage_windows(_create_swin(model_name, window_size=4, window_ratio=window_ratio), 4)
+
+
+@pytest.mark.base
+@pytest.mark.parametrize('model_name,img_size', _SWIN_FAMILY)
+def test_swin_family_set_input_size_invalid_and_min_windows(model_name, img_size):
+    # an invalid window spec must raise before any part of the model is changed
+    model = _create_swin(model_name)
+    state = {k: v.clone() for k, v in model.state_dict().items()}
+    structure = _swin_structure(model)
+    for window_kwargs in [
+        dict(window_ratio=(8, 4)),  # wrong number of stages
+        dict(window_ratio=0),
+        dict(window_size=(7, 7, 7)),  # wrong number of stages
+        dict(window_size=0),
+    ]:
+        with pytest.raises(AssertionError):
+            model.set_input_size(img_size=(img_size * 2, img_size * 2), **window_kwargs)
+        assert model.patch_embed.img_size == (img_size, img_size)
+        assert _swin_structure(model) == structure
+        for k, v in model.state_dict().items():
+            assert torch.equal(v, state[k]), k
+    with torch.no_grad():
+        model(torch.randn(1, 3, img_size, img_size))
+
+    # windows never drop below 1, and a window of 1 must give finite outputs (SwinV2 log-CPB divides by window - 1)
+    for size, window_kwargs in [((64, 64), dict(window_ratio=32)), ((32, 32), dict())]:
+        model.set_input_size(img_size=size, **window_kwargs)
+        assert all(w >= 1 for b in _swin_blocks(model) for w in b.window_size)
+        with torch.no_grad():
+            assert torch.isfinite(model(torch.randn(1, 3, *size))).all()
+
+
+@pytest.mark.base
+@pytest.mark.parametrize('model_name', [m for m, _ in _SWIN_FAMILY])
+def test_swin_family_resize_metadata(model_name):
+    from timm.models._features import FeatureGetterNet
+
+    model = _create_swin(model_name, img_size=(64, 96), patch_size=2, window_size=4)
+    features = FeatureGetterNet(model, out_indices=(0, 1, 2, 3)).eval()
+    for size, patch_size in [((64, 96), 2), ((96, 128), 4), ((64, 96), 2)]:
+        if model_name.startswith('swinv2_cr'):
+            patch_size = 2  # V2 CR only exposes patch_size in its constructor.
+            model.set_input_size(img_size=size)
+            assert model.img_size == size
+        else:
+            model.set_input_size(img_size=size, patch_size=patch_size)
+        grid_size = tuple(s // patch_size for s in size)
+        assert model.patch_embed.img_size == size
+        assert model.patch_embed.grid_size == grid_size
+        assert model.patch_embed.num_patches == grid_size[0] * grid_size[1]
+        reductions = [patch_size * 2 ** i for i in range(4)]
+        assert features.feature_info.reduction() == reductions
+        with torch.no_grad():
+            outputs = features(torch.randn(1, 3, *size))
+        assert [tuple(x.shape[-2:]) for x in outputs] == [tuple(s // r for s in size) for r in reductions]
+
+
+@pytest.mark.base
+@pytest.mark.parametrize('model_name', [m for m, _ in _SWIN_FAMILY])
+def test_swin_family_resize_odd_stage_sizes(model_name):
+    model = _create_swin(model_name, img_size=224, window_size=7)
+    for size in [(232, 248), (248, 232), (224, 224)]:
+        model.set_input_size(img_size=size, window_size=7)
+        ref = _create_swin(model_name, img_size=size, window_size=7)
+        dynamic = _create_swin(model_name, img_size=size, window_size=7, strict_img_size=False)
+        ref.load_state_dict(model.state_dict())
+        dynamic.load_state_dict(model.state_dict())
+        x = torch.randn(1, 3, *size)
+        with torch.no_grad():
+            output, features = model.forward_intermediates(x)
+            torch.testing.assert_close(output, ref.forward_features(x))
+            torch.testing.assert_close(output, dynamic.forward_features(x))
+        stages = model.layers if hasattr(model, 'layers') else model.stages
+        grid_size = tuple(s // 4 for s in size)
+        for index, (stage, feature) in enumerate(zip(stages, features)):
+            if index:
+                grid_size = tuple((s + 1) // 2 for s in grid_size)
+            assert tuple(feature.shape[-2:]) == grid_size
+            for block in stage.blocks:
+                recorded_size = block.feat_size if hasattr(block, 'feat_size') else block.input_resolution
+                assert recorded_size == grid_size
+
+
+@pytest.mark.base
+@pytest.mark.parametrize('model_name', [m for m, _ in _SWIN_FAMILY])
+def test_swin_family_set_input_size_after_pruning(model_name):
+    model = _create_swin(model_name, img_size=(64, 96))
+    model.prune_intermediate_layers(indices=[0, 1], prune_norm=True)
+    assert len(model._ref_window_sizes) == 2
+    # patch grid at (96, 128) is (24, 32)
+    for window_kwargs, windows in [
+        (dict(window_size=4), 4),
+        (dict(window_size=((2, 4), (4, 2))), ((2, 4), (4, 2))),
+        (dict(window_ratio=8), (3, 4)),
+        (dict(window_ratio=(8, 4)), ((3, 4), (6, 8))),  # two ratio values are two stages, not (h, w)
+        (dict(), ((3, 4), (6, 8))),
+    ]:
+        model.set_input_size(img_size=(96, 128), **window_kwargs)
+        _assert_swin_stage_windows(model, windows)
+        with torch.no_grad():
+            features = model.forward_intermediates(
+                torch.randn(1, 3, 96, 128), intermediates_only=True,
+            )
+        assert len(features) == 2
+        assert [x.shape[-2:] for x in features] == [(24, 32), (12, 16)]
+        assert all(torch.isfinite(x).all() for x in features)
+
+
+@pytest.mark.base
+@pytest.mark.parametrize('model_name', [m for m, _ in _SWIN_FAMILY])
+def test_swin_family_script_after_resize(model_name):
+    import io
+
+    model = _create_swin(model_name, img_size=(64, 96), window_size=(2, 3))
+    original_script = torch.jit.script(model)
+    for window_kwargs in [dict(window_ratio=(8, 8, 4, 8)), dict(window_size=2), dict(window_size=1)]:
+        model.set_input_size(img_size=(96, 128), **window_kwargs)
+        scripted = torch.jit.script(model)
+        buffer = io.BytesIO()
+        torch.jit.save(scripted, buffer)
+        buffer.seek(0)
+        reloaded = torch.jit.load(buffer)
+        x = torch.randn(1, 3, 96, 128)
+        with torch.no_grad():
+            expected = model(x)
+            torch.testing.assert_close(scripted(x), expected)
+            torch.testing.assert_close(reloaded(x), expected)
+    # Scripting captures geometry; resizing the eager model does not resize an existing ScriptModule.
+    assert original_script.patch_embed.img_size == (64, 96)
+    assert not hasattr(original_script, 'set_input_size')
+
+
+@pytest.mark.base
+@pytest.mark.skipif(not hasattr(torch, 'compile'), reason='requires torch.compile')
+@pytest.mark.parametrize('model_name', [m for m, _ in _SWIN_FAMILY])
+def test_swin_family_compile_resize_guards(model_name):
+    model = _create_swin(model_name, img_size=(64, 96), window_size=(2, 3))
+    graphs = []
+
+    def backend(graph, example_inputs):
+        graphs.append(graph)
+        return graph.forward
+
+    compiled = torch.compile(model, backend=backend, fullgraph=True)
+    for resize_kwargs, size, num_graphs in [
+        (None, (64, 96), 1),
+        (dict(), (64, 96), 1),
+        (dict(img_size=(96, 128), window_ratio=(8, 8, 4, 8)), (96, 128), 2),
+        (dict(window_size=2), (96, 128), 3),
+    ]:
+        if resize_kwargs is not None:
+            compiled.set_input_size(**resize_kwargs)
+        x = torch.randn(1, 3, *size)
+        with torch.no_grad():
+            torch.testing.assert_close(compiled(x), model(x))
+        assert len(graphs) == num_graphs
+
+
+@pytest.mark.base
+def test_hybrid_vit_set_input_size_dtype():
+    # the backbone forward used to size the hybrid embed must follow the model device / dtype
+    kwargs = dict(embed_dim=32, depth=1, num_heads=1, num_classes=5)
+    model = create_model('vit_tiny_r_s16_p8_224', **kwargs).to(torch.bfloat16).eval()
+    state = {k: v.clone() for k, v in model.state_dict().items()}
+    model.set_input_size()  # no-op
+    assert all(torch.equal(v, state[k]) for k, v in model.state_dict().items())
+    model.set_input_size(img_size=(256, 256))
+    ref = create_model('vit_tiny_r_s16_p8_224', img_size=256, **kwargs)
+    assert model.patch_embed.grid_size == ref.patch_embed.grid_size
+    model.set_input_size(patch_size=(4, 4))
+    assert model.patch_embed.proj.weight.dtype == torch.bfloat16
+    with torch.no_grad():
+        assert model(torch.randn(1, 3, 256, 256, dtype=torch.bfloat16)).shape == (1, 5)
+
+
+_RELPOS_FAMILY = [
+    # model, ctor kwargs, base img size, resized img size
+    ('test_maxvit', dict(), 160, 224),  # RelPosBias, window / grid partition attn
+    ('test_maxvit', dict(transformer_rel_pos_type='mlp'), 160, 224),  # RelPosMlp
+    ('test_maxvit', dict(transformer_rel_pos_type='bias_tf'), 160, 224),  # RelPosBiasTf
+    ('test_coatnet', dict(), 160, 224),  # full attn transformer stages w/ RelPosBias
+    ('test_maxvit', dict(block_type=('PM',) * 4), 160, 224),  # parallel partition attn
+    ('beit_base_patch16_224', dict(embed_dim=64, depth=2, num_heads=2), 224, 256),
+    ('beit_base_patch16_224', dict(embed_dim=64, depth=2, num_heads=2, use_shared_rel_pos_bias=True), 224, 256),
+    ('test_vit_relpos', dict(), 160, 224),  # RelPosMlp
+    ('test_vit_relpos', dict(rel_pos_type='bias'), 160, 224),
+    ('test_vit_relpos', dict(shared_rel_pos=True), 160, 224),  # shared rel pos
+    ('efficientvit_m0', dict(), 224, 256),
+    ('efficientvit_m0', dict(), 224, 160),  # last stage feature size drops below the window size
+]
+
+
+_RELPOS_NON_SQUARE = [
+    ('test_maxvit', dict()),
+    ('test_maxvit', dict(transformer_rel_pos_type='bias_tf')),
+    ('test_coatnet', dict()),
+    ('beit_base_patch16_224', dict(embed_dim=64, depth=2, num_heads=2)),
+    ('test_vit_relpos', dict(rel_pos_type='bias')),
+    ('swin_tiny_patch4_window7_224', dict(embed_dim=16, depths=(1, 1, 1, 1), num_heads=(1, 1, 1, 1))),
+]
+
+
+@pytest.mark.base
+@pytest.mark.parametrize('model_name,kwargs', [
+    ('swin_tiny_patch4_window7_224', dict(embed_dim=16, depths=(1, 1, 1, 1), num_heads=(1, 1, 1, 1))),
+    ('swinv2_tiny_window8_256', dict(embed_dim=16, depths=(1, 1, 1, 1), num_heads=(1, 1, 1, 1))),
+    ('davit_tiny', dict(embed_dims=(16, 32, 64, 128), depths=(1, 1, 1, 1), num_heads=(1, 1, 1, 1))),
+    ('nextvit_small', dict(depths=(1, 1, 5, 1))),
+])
+def test_headless_checkpoint_reload(model_name, kwargs):
+    # a checkpoint saved w/o the classifier is still a timm checkpoint, the filter must not remap it as an original
+    import importlib
+    model = create_model(model_name, num_classes=0, **kwargs).eval()
+    filter_fn = importlib.import_module(type(model).__module__).checkpoint_filter_fn
+    reloaded = create_model(model_name, num_classes=0, **kwargs).eval()
+    # Safetensors does not preserve the model's parameter registration order.
+    state_dict = dict(sorted(model.state_dict().items()))
+    reloaded.load_state_dict(filter_fn(state_dict, reloaded))
+    x = torch.randn(1, 3, *model.pretrained_cfg['input_size'][-2:])
+    with torch.no_grad():
+        torch.testing.assert_close(reloaded(x), model(x), rtol=0, atol=0)
+
+
+@pytest.mark.base
+@pytest.mark.parametrize('model_name,kwargs', _RELPOS_NON_SQUARE)
+def test_relpos_non_square_checkpoint_reload(model_name, kwargs):
+    # a checkpoint saved at a non-square size (non-square windows / rel pos tables) must load unchanged through the
+    # pretrained checkpoint filter into a model created at that same size
+    import importlib
+    kwargs = dict(kwargs, num_classes=5, img_size=(224, 288))
+    model = create_model(model_name, **kwargs).eval()
+    filter_fn = importlib.import_module(type(model).__module__).checkpoint_filter_fn
+    reloaded = create_model(model_name, **kwargs).eval()
+    reloaded.load_state_dict(filter_fn(model.state_dict(), reloaded))
+    x = torch.randn(1, 3, 224, 288)
+    with torch.no_grad():
+        torch.testing.assert_close(reloaded(x), model(x))
+
+
+@pytest.mark.base
+@pytest.mark.parametrize('model_name,kwargs', _RELPOS_NON_SQUARE)
+def test_relpos_non_square_set_input_size(model_name, kwargs):
+    # resizing away from a non-square size must interpolate from the current (non-square) rel pos table
+    model = create_model(model_name, num_classes=5, **kwargs).eval()
+    for size in [(224, 288), (288, 224), (224, 224)]:
+        model.set_input_size(img_size=size)
+        with torch.no_grad():
+            assert torch.isfinite(model(torch.randn(1, 3, *size))).all()
+
+
+@pytest.mark.base
+@pytest.mark.parametrize('model_name,kwargs,img_size,new_size', _RELPOS_FAMILY)
+def test_relpos_family_set_input_size(model_name, kwargs, img_size, new_size):
+    import importlib
+    kwargs = dict(kwargs, num_classes=5)
+    model = create_model(model_name, **kwargs).eval()
+    filter_fn = importlib.import_module(type(model).__module__).checkpoint_filter_fn
+    # construct at the new size & load resized weights via the checkpoint filter, as a pretrained load would
+    expected = create_model(model_name, img_size=new_size, **kwargs).eval()
+    expected.load_state_dict(filter_fn(model.state_dict(), expected))
+    model.set_input_size(img_size=(new_size, new_size))
+    x = torch.randn(1, 3, new_size, new_size)
+    with torch.no_grad():
+        torch.testing.assert_close(model(x), expected(x))
+
+    # resize back on an already cast model, recomputed params / buffers must follow the model dtype
+    model = model.to(torch.bfloat16)
+    model.set_input_size(img_size=img_size)
+    for name, t in list(model.named_parameters()) + list(model.named_buffers()):
+        if t.is_floating_point():
+            assert t.dtype == torch.bfloat16, name
+    with torch.no_grad():
+        model(torch.randn(1, 3, img_size, img_size).to(torch.bfloat16))
+
+
+@pytest.mark.base
+@pytest.mark.parametrize('model_name', [m for m, _ in _SWIN_FAMILY])
+def test_swin_family_window_padding(model_name):
+    # 224 with window 8 -> 28x28 stage is not a window multiple, static mask must match the padded dynamic mask
+    kwargs = dict(img_size=224, window_size=8, **_SWIN_KWARGS)
+    static = create_model(model_name, **kwargs).eval()
+    dynamic = create_model(model_name, strict_img_size=False, **kwargs).eval()
+    dynamic.load_state_dict(static.state_dict())
+    assert any(b.attn_mask is not None for b in _swin_blocks(static))
+    x = torch.randn(1, 3, 224, 224)
+    with torch.no_grad():
+        torch.testing.assert_close(static(x), dynamic(x))
+
+
+@pytest.mark.base
+@pytest.mark.parametrize('model_name,img_size', _SWIN_FAMILY)
+def test_swin_family_dynamic_mask_trace(model_name, img_size):
+    # the dynamic mask size must stay traceable (legacy ONNX export), trace at one size & run at another
+    model = create_model(model_name, strict_img_size=False, **_SWIN_KWARGS).eval()
+    traced = torch.jit.trace(model, torch.randn(1, 3, img_size, img_size), check_trace=False)
+    x = torch.randn(1, 3, 224, 320)
+    with torch.no_grad():
+        torch.testing.assert_close(traced(x), model(x))
+
+
+@pytest.mark.base
+@pytest.mark.parametrize('model_name', [
+    'levit_128s', 'levit_conv_128s', 'efficientformer_l1', 'efficientformerv2_s0', 'tiny_vit_5m_224', 'efficientvit_m0',
+])
+def test_eval_refreshes_attention_bias_cache(model_name):
+    # A model that stays in eval mode while its weights change (e.g. an EMA copy between validation runs)
+    # must not keep using the attention biases cached from the previous weights once eval() is called again.
+    model = create_model(model_name).eval()
+    attn_modules = [m for m in model.modules() if hasattr(m, 'attention_bias_cache')]
+    assert attn_modules
+    x = torch.randn(1, *model.pretrained_cfg['input_size'])
+    with torch.no_grad():
+        model(x)
+        for m in attn_modules:
+            m.attention_biases.normal_()
+        model.eval()
+        model(x)
+        for m in attn_modules:
+            torch.testing.assert_close(
+                m.get_attention_biases(x.device),
+                m.attention_biases[:, m.attention_bias_idxs],
+            )
+
+
+@pytest.mark.base
+@pytest.mark.parametrize('dtype', [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize('module_name, class_name, kwargs', [
+    ('efficientformer', 'Attention', dict(dim=16, key_dim=4, num_heads=2, attn_ratio=2, resolution=2)),
+    ('efficientformer_v2', 'Attention2d', dict(dim=16, key_dim=4, num_heads=2, attn_ratio=2, resolution=2)),
+    ('efficientformer_v2', 'Attention2dDownsample', dict(dim=16, key_dim=4, num_heads=2, attn_ratio=2, resolution=2)),
+    ('efficientvit_msra', 'CascadedGroupAttention', dict(dim=16, key_dim=4, num_heads=2, attn_ratio=2, resolution=2,
+                                                       kernels=(3, 3))),
+    ('levit', 'Attention', dict(dim=16, key_dim=4, num_heads=2, attn_ratio=2, resolution=2)),
+    ('levit', 'AttentionDownsample', dict(in_dim=16, out_dim=16, key_dim=4, num_heads=2, attn_ratio=2, resolution=2)),
+    ('tiny_vit', 'Attention', dict(dim=16, key_dim=4, num_heads=2, attn_ratio=2, resolution=(2, 2))),
+])
+def test_eval_attention_bias_cache_after_dtype_change(module_name, class_name, kwargs, dtype):
+    module = importlib.import_module(f'timm.models.{module_name}')
+    attention = getattr(module, class_name)(**kwargs)
+    attention.eval()
+    device = torch.device('cpu')
+    with torch.no_grad():
+        cached = attention.get_attention_biases(device)
+        assert cached.dtype == torch.float32
+        attention.to(dtype=dtype)
+        refreshed = attention.get_attention_biases(device)
+        assert refreshed.dtype == dtype
+        torch.testing.assert_close(refreshed, attention.attention_biases[:, attention.attention_bias_idxs])
+        assert attention.get_attention_biases(device) is refreshed
+
+        attention.to(dtype=torch.float32)
+        restored = attention.get_attention_biases(device)
+        assert restored.dtype == torch.float32
+        torch.testing.assert_close(restored, attention.attention_biases[:, attention.attention_bias_idxs])
+
+
+@pytest.mark.base
+def test_eval_attention_forward_after_dtype_change():
+    from copy import deepcopy
+    from timm.models.efficientformer import Attention
+
+    attention = Attention(dim=16, key_dim=4, num_heads=2, attn_ratio=2, resolution=2)
+    attention.eval()
+    x = torch.randn(1, 4, 16)
+    with torch.no_grad():
+        attention.attention_biases.normal_()
+        reference = deepcopy(attention).to(dtype=torch.bfloat16)
+        expected = reference(x.to(dtype=torch.bfloat16))
+        attention(x)  # populate the float32 eval cache
+        attention.to(dtype=torch.bfloat16)
+        actual = attention(x.to(dtype=torch.bfloat16))
+        torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.base
+def test_attention_bias_cache_apply_preserves_recurse_argument():
+    from inspect import signature
+    from timm.models.efficientformer import Attention
+
+    if 'recurse' not in signature(torch.nn.Module._apply).parameters:
+        pytest.skip('This PyTorch version does not support the recurse argument')
+
+    attention = Attention(dim=16, key_dim=4, num_heads=2, attn_ratio=2, resolution=2)
+    attention.eval()
+    attention.get_attention_biases(torch.device('cpu'))
+    attention._apply(lambda tensor: tensor.double() if tensor.is_floating_point() else tensor, recurse=False)
+    assert not attention.attention_bias_cache
+    assert attention.attention_biases.dtype == torch.float64
+    assert attention.qkv.weight.dtype == torch.float32

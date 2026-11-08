@@ -19,15 +19,21 @@ from contextlib import suppress
 from functools import partial
 
 import torch
-import torch.nn as nn
 import torch.nn.parallel
 
 from timm import utils
-from timm.data import create_dataset, create_loader, resolve_data_config, RealLabelsImagenet
+from timm.data import (
+    create_dataset,
+    create_loader,
+    resolve_input_data_config,
+    RealLabelsImagenet,
+    MultiLabelTarget,
+)
 from timm.layers import apply_test_time_pool, set_fast_norm
-from timm.models import create_model, load_checkpoint, is_model, list_models
-from timm.utils import accuracy, AverageMeter, natural_key, setup_default_logging, set_jit_fuser, \
+from timm.models import create_model, load_checkpoint, is_model, list_models, resolve_model_input_args
+from timm.utils import AverageMeter, natural_key, setup_default_logging, set_jit_fuser, \
     decay_batch_step, check_batch_size_retry, ParseKwargs, reparameterize_model
+from timm.task import ClassificationEvaluator, MultiLabelClassificationEvaluator
 
 
 try:
@@ -48,6 +54,10 @@ _logger = logging.getLogger('validate')
 
 
 parser = argparse.ArgumentParser(description='PyTorch ImageNet Validation')
+parser.add_argument('--task', default='classification', choices=('classification', 'multilabel'),
+                    help='Classification task (default: classification)')
+parser.add_argument('--multilabel-threshold', default=0.5, type=float,
+                    help='Sigmoid probability threshold for multi-label F1 metrics (default: 0.5)')
 parser.add_argument('data', nargs='?', metavar='DIR', const=None,
                     help='path to dataset (*deprecated*, use --data-dir)')
 parser.add_argument('--data-dir', metavar='DIR',
@@ -68,6 +78,9 @@ parser.add_argument('--input-img-mode', default=None, type=str,
                    help='Dataset image conversion mode for input images.')
 parser.add_argument('--target-key', default=None, type=str,
                    help='Dataset key for target labels.')
+parser.add_argument('--target-format', default=None, type=str, choices=('indices', 'multihot'),
+                    help='Single-key multi-label target format: a list of class indices (default) or a dense multi-hot '
+                         'vector of length --num-classes. Comma separated --target-key fields define their own format.')
 parser.add_argument('--dataset-trust-remote-code', action='store_true', default=False,
                    help='Allow huggingface dataset import to execute code downloaded from the dataset\'s repo.')
 
@@ -172,10 +185,31 @@ parser.add_argument('--naflex-max-seq-len', type=int, default=576,
                    help='Fixed maximum sequence length for NaFlex loader (validation)')
 
 
+def create_evaluator(args, device=None):
+    """Create the evaluator for the selected task. Its default_metric and metric_names drive reporting."""
+    if args.task == 'multilabel':
+        return MultiLabelClassificationEvaluator(device=device, threshold=args.multilabel_threshold)
+    return ClassificationEvaluator(device=device)
+
+
 def validate(args):
+    multi_label = args.task == 'multilabel'
+    if multi_label:
+        if args.num_classes is None or args.num_classes <= 0:
+            raise ValueError('--task multilabel requires a positive --num-classes.')
+        if args.real_labels or args.valid_labels:
+            raise ValueError('--real-labels and --valid-labels are only supported for single-label classification.')
+        if not 0. < args.multilabel_threshold < 1.:
+            raise ValueError('--multilabel-threshold must be between 0 and 1.')
+    elif args.target_format == 'multihot':
+        raise ValueError('--target-format multihot requires --task multilabel.')
     # might as well try to validate something
     args.pretrained = args.pretrained or not args.checkpoint
     args.prefetcher = not args.no_prefetcher
+    if args.naflex_loader and args.no_prefetcher:
+        raise ValueError('--naflex-loader requires the prefetcher, --no-prefetcher is not supported.')
+    if args.naflex_loader and args.channels_last:
+        raise ValueError('--channels-last does not apply to --naflex-loader.')
 
     if torch.cuda.is_available():
         torch.backends.cuda.matmul.allow_tf32 = True
@@ -213,20 +247,16 @@ def validate(args):
         set_fast_norm()
 
     # create model
-    in_chans = 3
-    if args.in_chans is not None:
-        in_chans = args.in_chans
-    elif args.input_size is not None:
-        in_chans = args.input_size[0]
-
     model = create_model(
-        args.model,
-        pretrained=args.pretrained,
-        num_classes=args.num_classes,
-        in_chans=in_chans,
-        global_pool=args.gp,
-        scriptable=args.torchscript,
-        **args.model_kwargs,
+        **resolve_model_input_args(
+            args.model,
+            vars(args),
+            pretrained=args.pretrained,
+            num_classes=args.num_classes,
+            global_pool=args.gp,
+            scriptable=args.torchscript,
+            **args.model_kwargs,
+        )
     )
     if args.num_classes is None:
         assert hasattr(model, 'num_classes'), 'Model must have `num_classes` attr if not set on cmd line/config.'
@@ -241,9 +271,9 @@ def validate(args):
     param_count = sum([m.numel() for m in model.parameters()])
     _logger.info('Model %s created, param count: %d' % (args.model, param_count))
 
-    data_config = resolve_data_config(
+    data_config = resolve_input_data_config(
+        model,
         vars(args),
-        model=model,
         use_test_size=not args.use_train_size,
         verbose=True,
     )
@@ -268,7 +298,7 @@ def validate(args):
     if args.num_gpu > 1:
         model = torch.nn.DataParallel(model, device_ids=list(range(args.num_gpu)))
 
-    criterion = nn.CrossEntropyLoss().to(device)
+    evaluator = create_evaluator(args, device)
 
     root_dir = args.data or args.data_dir
     if args.input_img_mode is None:
@@ -286,6 +316,9 @@ def validate(args):
         input_key=args.input_key,
         input_img_mode=input_img_mode,
         target_key=args.target_key,
+        target_format=args.target_format,
+        target_transform=MultiLabelTarget(args.num_classes, dense=args.target_format == 'multihot')
+        if multi_label else None,
         trust_remote_code=args.dataset_trust_remote_code,
         seed=args.seed,
     )
@@ -310,6 +343,7 @@ def validate(args):
         from timm.data  import create_naflex_loader
         loader = create_naflex_loader(
             dataset,
+            channels=data_config['input_size'][0],
             batch_size=args.batch_size,
             use_prefetcher=args.prefetcher,
             interpolation=data_config['interpolation'],
@@ -345,9 +379,6 @@ def validate(args):
         )
 
     batch_time = AverageMeter()
-    losses = AverageMeter()
-    top1 = AverageMeter()
-    top5 = AverageMeter()
 
     if args.metrics_avg:
         all_preds = []
@@ -377,20 +408,16 @@ def validate(args):
 
                 if valid_labels is not None:
                     output = output[:, valid_labels]
-                loss = criterion(output, target)
+                evaluator.update(output, target)
 
             if real_labels is not None:
                 real_labels.add_result(output)
 
-            # measure accuracy and record loss
             batch_size = output.shape[0]
-            acc1, acc5 = accuracy(output.detach(), target, topk=(1, 5))
-            losses.update(loss.item(), batch_size)
-            top1.update(acc1.item(), batch_size)
-            top5.update(acc5.item(), batch_size)
 
             if args.metrics_avg:
-                predictions = torch.argmax(output, dim=1)
+                predictions = output.float().sigmoid() >= args.multilabel_threshold if multi_label else \
+                    torch.argmax(output, dim=1)
                 all_preds.append(predictions.cpu())
                 all_targets.append(target.cpu())
 
@@ -399,27 +426,23 @@ def validate(args):
             end = time.time()
 
             if batch_idx % args.log_freq == 0:
+                metric_text = '  '.join(f'{name}: {value:.4f}' for name, value in evaluator.summary().items())
                 _logger.info(
                     'Test: [{0:>4d}/{1}]  '
                     'Time: {batch_time.val:.3f}s ({batch_time.avg:.3f}s, {rate_avg:>7.2f}/s)  '
-                    'Loss: {loss.val:>7.4f} ({loss.avg:>6.4f})  '
-                    'Acc@1: {top1.val:>7.3f} ({top1.avg:>7.3f})  '
-                    'Acc@5: {top5.val:>7.3f} ({top5.avg:>7.3f})'.format(
+                    '{metrics}'.format(
                         batch_idx,
                         len(loader),
                         batch_time=batch_time,
                         rate_avg=batch_size / batch_time.avg,
-                        loss=losses,
-                        top1=top1,
-                        top5=top5
+                        metrics=metric_text,
                     )
                 )
 
+    metrics = evaluator.compute()
     if real_labels is not None:
         # real labels mode replaces topk values at the end
-        top1a, top5a = real_labels.get_accuracy(k=1), real_labels.get_accuracy(k=5)
-    else:
-        top1a, top5a = top1.avg, top5.avg
+        metrics['top1'], metrics['top5'] = real_labels.get_accuracy(k=1), real_labels.get_accuracy(k=5)
 
     metric_results = {}
     if args.metrics_avg:
@@ -434,10 +457,16 @@ def validate(args):
             f'{args.metrics_avg}_f1_score': round(100 * f1, 4),
         }
 
+    if multi_label:
+        task_results = {name: round(value, 4) for name, value in metrics.items() if name != 'loss'}
+    else:
+        task_results = dict(
+            top1=round(metrics['top1'], 4), top1_err=round(100 - metrics['top1'], 4),
+            top5=round(metrics['top5'], 4), top5_err=round(100 - metrics['top5'], 4),
+        )
     results = OrderedDict(
         model=args.model,
-        top1=round(top1a, 4), top1_err=round(100 - top1a, 4),
-        top5=round(top5a, 4), top5_err=round(100 - top5a, 4),
+        **task_results,
         **metric_results,
         param_count=round(param_count / 1e6, 2),
         img_size=data_config['input_size'][-1],
@@ -445,8 +474,7 @@ def validate(args):
         interpolation=data_config['interpolation'],
     )
 
-    log_string = ' * Acc@1 {:.3f} ({:.3f}) Acc@5 {:.3f} ({:.3f})'.format(
-       results['top1'], results['top1_err'], results['top5'], results['top5_err'])
+    log_string = ' * ' + '  '.join(f'{name}: {value:.4f}' for name, value in metrics.items())
     if metric_results:
         log_string += ' | Precision({avg}) {prec:.3f} | Recall({avg}) {rec:.3f} | F1-score({avg}) {f1:.3f}'.format(
             avg=args.metrics_avg,
@@ -537,7 +565,8 @@ def main():
                 results.append(r)
         except KeyboardInterrupt as e:
             pass
-        results = sorted(results, key=lambda x: x['top1'], reverse=True)
+        metric = create_evaluator(args).default_metric
+        results = sorted(results, key=lambda x: x[metric], reverse=True)
     else:
         if args.retry:
             results = _try_run(args, args.batch_size)

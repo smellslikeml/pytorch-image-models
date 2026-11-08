@@ -7,11 +7,11 @@ An improved version of the Vision Transformer with:
 4. Support for FlexiViT variable patch size
 5. Support for NaViT fractional/factorized position embedding
 
-Based on ideas from:
-- Original Vision Transformer: https://arxiv.org/abs/2010.11929
-- FlexiViT: https://arxiv.org/abs/2212.08013
-- NaViT: https://arxiv.org/abs/2307.06304
-- NaFlex (SigLip-2): https://arxiv.org/abs/2502.14786
+Based on ideas from (original ViT, FlexiViT, NaViT, and NaFlex from SigLIP-2):
+- `An Image is Worth 16x16 Words: Transformers for Image Recognition at Scale` - https://arxiv.org/abs/2010.11929
+- `FlexiViT: One Model for All Patch Sizes` - https://arxiv.org/abs/2212.08013
+- `Patch n' Pack: NaViT, a Vision Transformer for any Aspect Ratio and Resolution` - https://arxiv.org/abs/2307.06304
+- `SigLIP 2: Multilingual Vision-Language Encoders with Improved Semantic Understanding, Localization, and Dense Features` - https://arxiv.org/abs/2502.14786
 
 Hacked together by / Copyright 2025, Ross Wightman, Hugging Face
 """
@@ -26,7 +26,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from timm.data import IMAGENET_INCEPTION_MEAN, IMAGENET_INCEPTION_STD
+from timm.data import IMAGENET_INCEPTION_MEAN, IMAGENET_INCEPTION_STD, OPENAI_CLIP_MEAN, OPENAI_CLIP_STD
 from timm.layers import (
     get_device_dtype,
     AttentionPoolLatent,
@@ -42,13 +42,14 @@ from timm.layers import (
     disable_compiler,
     calculate_drop_path_rates,
 )
+from ._input import update_model_args
 from ._builder import build_model_with_cfg
 from ._features import feature_take_indices
 from ._features_fx import register_notrace_function, register_notrace_module
 from ._manipulate import checkpoint, named_apply
 from ._registry import register_model, generate_default_cfgs
 from .eva import EvaBlock
-from .vision_transformer import Block, global_pool_nlc
+from .vision_transformer import Block, global_pool_nlc, _convert_radio
 
 __all__ = ['NaFlexVitCfg', 'NaFlexVit']
 
@@ -73,6 +74,7 @@ class NaFlexVitCfg:
     scale_mlp_norm: bool = False  # Apply scaling norm to MLP
 
     # Attention parameters
+    num_kv_heads: Optional[Union[int, Tuple[int, ...]]] = None  # Scalar or per-block KV heads (attn_type='rope')
     qkv_bias: bool = True
     qk_norm: bool = False
     proj_bias: bool = True
@@ -97,6 +99,8 @@ class NaFlexVitCfg:
     pos_embed_grid_size: Optional[Tuple[int, int]] = (16, 16)  # Grid size for position embedding initialization
     pos_embed_interp_mode: str = 'bicubic'  # Interpolation mode for position embedding resizing
     pos_embed_ar_preserving: bool = False  # Whether to preserve aspect ratio during position embedding interpolation
+    pos_embed_antialias: bool = True  # Whether to antialias when downsampling learned position embeddings
+    pos_embed_align_corners: bool = False  # Use align_corners when resampling learned position embeddings
     pos_embed_use_grid_sample: bool = False  # Whether to use grid_sample for naflex position embedding interpolation
 
     # ROPE specific configuration
@@ -106,6 +110,9 @@ class NaFlexVitCfg:
     rope_grid_offset: float = 0.  # Grid offset for non-pixel ROPE mode
     rope_grid_indexing: str = 'ij'  # Grid indexing mode for ROPE ('ij' or 'xy')
     rope_rotate_half: bool = False  # Use rotate_half layout for ROPE (DINOv3 and 'mrope' use True)
+    rope_shift_coords: Optional[float] = None  # Train-time coordinate shift in [-s, s], in the rope grid's units
+    rope_jitter_coords: Optional[float] = None  # Train-time per-axis scale in [1/J, J]
+    rope_rescale_coords: Optional[float] = None  # Train-time shared scale in [1/R, R]
     rope_mrope_section: Optional[Tuple[int, int, int]] = None  # (T,H,W) channel split for rope_type='mrope'
 
     # Image processing
@@ -143,7 +150,9 @@ class NaFlexVitCfg:
     attn_type: str = 'standard'  # Attention type: 'standard', 'eva', 'rope'
     attn_gated: bool = False  # Apply sigmoid output gate in attention (anti attention-sink, GenLIP-style)
     swiglu_mlp: bool = False  # Use SwiGLU MLP variant
+    swiglu_align_to: int = 0  # Round SwiGLU hidden width up to this multiple, 0 disables alignment
     qkv_fused: bool = True  # Whether to use fused QKV projections
+    attn_only_layer_scale: bool = False  # Apply LayerScale to the attention branch only
 
     # Variable patch size support
     enable_patch_interpolator: bool = False  # Enable dynamic patch size support
@@ -216,12 +225,15 @@ def calculate_naflex_grid_sizes(_coord: torch.Tensor):
 def _normalize_naflex_grid_sample_coords(
         patch_coord: torch.Tensor,
         ar_preserving: bool = False,
+        align_corners: bool = False,
 ) -> torch.Tensor:
-    """Normalize NaFlex patch coordinates for ``grid_sample`` with ``align_corners=False``."""
+    """Normalize NaFlex patch coordinates for ``grid_sample`` with matching ``align_corners``."""
     shapes = patch_coord.amax(dim=1) + 1
     if ar_preserving:
         shapes = shapes.amax(dim=1, keepdim=True).expand_as(shapes)
 
+    if align_corners:
+        return 2.0 * patch_coord.to(dtype=torch.float32) / (shapes[:, None, :] - 1).clamp(min=1) - 1.0
     return (2.0 * patch_coord.to(dtype=torch.float32) + 1.0) / shapes[:, None, :] - 1.0
 
 
@@ -254,7 +266,7 @@ class NaFlexRopeIterator:
         self._embeddings_per_size = {}
         for grid_size in unique_sizes:
             # get_embed returns all depths at once for mixed mode
-            rope_embed = rope_module.get_embed(shape=grid_size)
+            rope_embed = rope_module.get_embed(shape=grid_size, dtype=self.dtype)
             self._embeddings_per_size[grid_size] = rope_embed
 
     def __iter__(self):
@@ -289,18 +301,20 @@ class NaFlexRopeIterator:
         return batch_embed
 
 
-def get_block_fn(cfg: NaFlexVitCfg) -> Callable:
+def get_block_fn(cfg: NaFlexVitCfg, block_idx: int = 0) -> Callable:
     """Get appropriate block function based on configuration.
 
     Returns a partially applied block constructor with EVA-specific
-    or conflicting parameters pre-configured if needed.
+    or conflicting parameters pre-configured for the given block index if needed.
     """
     # Check if we need EVA block features
     use_eva_features = (
         cfg.attn_type in ('eva', 'rope') or
         cfg.rope_type not in ('', 'none') or  # Any ROPE type requires EVA blocks
         cfg.swiglu_mlp or
-        cfg.attn_gated  # gated attention is implemented on the EVA/rope attention path
+        cfg.attn_gated or  # gated attention is implemented on the EVA/rope attention path
+        cfg.attn_only_layer_scale or
+        cfg.num_kv_heads is not None
     )
 
     if use_eva_features:
@@ -310,13 +324,19 @@ def get_block_fn(cfg: NaFlexVitCfg) -> Callable:
             attn_type = 'rope'
 
         num_prefix_tokens = (1 if cfg.class_token else 0) + cfg.reg_tokens
+        num_kv_heads = cfg.num_kv_heads
+        if num_kv_heads is not None and not isinstance(num_kv_heads, int):
+            num_kv_heads = num_kv_heads[block_idx]
         return partial(
             EvaBlock,
             attn_type=attn_type,
             swiglu_mlp=cfg.swiglu_mlp,
+            swiglu_align_to=cfg.swiglu_align_to,
             scale_mlp=cfg.scale_mlp_norm,
             scale_attn_inner=cfg.scale_attn_inner_norm,
             qkv_fused=cfg.qkv_fused,
+            num_kv_heads=num_kv_heads,
+            attn_only_layer_scale=cfg.attn_only_layer_scale,
             num_prefix_tokens=num_prefix_tokens,
             rotate_half=cfg.rope_rotate_half or cfg.rope_type == 'mrope',  # MRoPE requires the half-rotation layout
             gated_attn=cfg.attn_gated,
@@ -375,6 +395,8 @@ class NaFlexEmbeds(nn.Module):
         pos_embed_grid_size: Grid size for position embedding initialization
         pos_embed_interp_mode: Interpolation mode for position embedding resizing
         pos_embed_ar_preserving: Whether to preserve aspect ratio during position embedding interpolation
+        pos_embed_antialias: Whether to antialias when downsampling learned position embeddings
+        pos_embed_align_corners: Whether to use align_corners when resampling learned position embeddings
         default_img_size: Default image size for position embedding grid calculation
     """
 
@@ -393,6 +415,8 @@ class NaFlexEmbeds(nn.Module):
             pos_embed_grid_size: Optional[Tuple[int, int]] = (14, 14),
             pos_embed_interp_mode: str = 'bicubic',
             pos_embed_ar_preserving: bool = False,
+            pos_embed_antialias: bool = True,
+            pos_embed_align_corners: bool = False,
             pos_embed_use_grid_sample: bool = False,
             input_norm_layer: Optional[Type[nn.Module]] = None,
             proj_norm_layer: Union[bool, Optional[Type[nn.Module]]] = None,
@@ -419,6 +443,8 @@ class NaFlexEmbeds(nn.Module):
             pos_embed_grid_size: Grid size for position embedding initialization.
             pos_embed_interp_mode: Interpolation mode for position embedding resizing.
             pos_embed_ar_preserving: Whether to preserve aspect ratio during interpolation.
+            pos_embed_antialias: Whether to antialias when downsampling learned position embeddings.
+            pos_embed_align_corners: Whether to use align_corners when resampling learned position embeddings.
             input_norm_layer: Normalization layer applied to input (linear mode only).
             proj_norm_layer: Normalization layer applied after projection.
             norm_layer: Default normalization layer.
@@ -432,6 +458,8 @@ class NaFlexEmbeds(nn.Module):
         self.num_reg_tokens = reg_tokens
         self.pos_embed_interp_mode = pos_embed_interp_mode
         self.pos_embed_ar_preserving = pos_embed_ar_preserving
+        self.pos_embed_antialias = pos_embed_antialias
+        self.pos_embed_align_corners = pos_embed_align_corners
         self.pos_embed_use_grid_sample = pos_embed_use_grid_sample
         self.patch_size = to_2tuple(patch_size)
         self.in_chans = in_chans
@@ -645,8 +673,8 @@ class NaFlexEmbeds(nn.Module):
                     pos_embed_nchw,
                     size=_interp_size,
                     mode=self.pos_embed_interp_mode,
-                    align_corners=False,
-                    antialias=True,
+                    align_corners=self.pos_embed_align_corners,
+                    antialias=self.pos_embed_antialias,
                 )[:, :, :size[0], :size[1]].flatten(2).transpose(1, 2)
             return pos_embed_flat.to(dtype=x.dtype)
 
@@ -686,12 +714,13 @@ class NaFlexEmbeds(nn.Module):
         grid = _normalize_naflex_grid_sample_coords(
             patch_coord,
             ar_preserving=self.pos_embed_ar_preserving,
+            align_corners=self.pos_embed_align_corners,
         ).flip(-1).unsqueeze(2)  # (B, N, 1, 2), grid_sample coordinate order is (x, y)
         pos_embed = F.grid_sample(
             self.pos_embed.permute(0, 3, 1, 2).expand(B, -1, -1, -1).float(),
             grid,
             mode=self.pos_embed_interp_mode,
-            align_corners=False,
+            align_corners=self.pos_embed_align_corners,
             padding_mode='border',
         ).to(dtype=x.dtype)  # (B, C, N, 1)
 
@@ -725,8 +754,8 @@ class NaFlexEmbeds(nn.Module):
                 self.pos_embed.permute(0, 3, 1, 2).float(),  # B,C,H,W
                 size=_interp_size,
                 mode=self.pos_embed_interp_mode,
-                align_corners=False,
-                antialias=True,
+                align_corners=self.pos_embed_align_corners,
+                antialias=self.pos_embed_antialias,
             )[:, :, :grid_size[0], :grid_size[1]].flatten(2).transpose(1, 2)
         pos_embed_flat = pos_embed_flat.to(dtype=x.dtype)
 
@@ -1173,21 +1202,28 @@ class NaFlexVit(nn.Module):
         # Initialize config
         cfg = cfg or NaFlexVitCfg()
         if kwargs:
+            unknown_kwargs = set(kwargs) - set(cfg.__dataclass_fields__.keys())
+            if unknown_kwargs:
+                raise TypeError(
+                    f'{type(self).__name__}.__init__() got unexpected keyword argument(s): {sorted(unknown_kwargs)}')
             cfg = _overlay_kwargs(cfg, **kwargs)
 
         # Validate configuration
-        assert cfg.global_pool in ('', 'avg', 'avgmax', 'max', 'token', 'map')
-        assert cfg.class_token or cfg.global_pool != 'token'
+        assert cfg.global_pool in ('', 'avg', 'avgmax', 'max', 'token', 'map'), \
+            'Only avg, avgmax, max, token or map pooling (or none) is supported.'
+        assert cfg.class_token or cfg.global_pool != 'token', 'Token pooling needs the class token.'
         assert cfg.pos_embed in ('', 'none', 'learned', 'factorized')
+        if cfg.num_kv_heads is not None and not isinstance(cfg.num_kv_heads, int):
+            assert len(cfg.num_kv_heads) == cfg.depth, 'num_kv_heads sequence must have one entry per block'
 
         # Resolve layer implementations
         norm_layer = get_norm_layer(cfg.norm_layer) or LayerNorm
         embed_norm_layer = get_norm_layer(cfg.embed_norm_layer)
         act_layer = get_act_layer(cfg.act_layer) or nn.GELU
-        block_fn = get_block_fn(cfg)
         mlp_layer = cfg.mlp_layer or Mlp   # TODO: Support configurable mlp_layer via string lookup
 
         # Store instance variables
+        self._traits = dict(fixed_input_size=False, first_conv='embeds.proj')
         self.num_classes = num_classes
         self.in_chans = in_chans
         self.global_pool = cfg.global_pool
@@ -1216,6 +1252,8 @@ class NaFlexVit(nn.Module):
             pos_embed_grid_size=cfg.pos_embed_grid_size,
             pos_embed_interp_mode=cfg.pos_embed_interp_mode,
             pos_embed_ar_preserving=cfg.pos_embed_ar_preserving,
+            pos_embed_antialias=cfg.pos_embed_antialias,
+            pos_embed_align_corners=cfg.pos_embed_align_corners,
             pos_embed_use_grid_sample=cfg.pos_embed_use_grid_sample,
             proj_norm_layer=embed_norm_layer,
             pos_drop_rate=cfg.pos_drop_rate,
@@ -1233,7 +1271,14 @@ class NaFlexVit(nn.Module):
             from timm.layers.pos_embed_sincos import (
                 RotaryEmbeddingCat, RotaryEmbeddingDinoV3, RotaryEmbeddingMixed, RotaryEmbeddingMRope,
             )
+            rope_aug_kwargs = dict(
+                shift_coords=cfg.rope_shift_coords,
+                jitter_coords=cfg.rope_jitter_coords,
+                rescale_coords=cfg.rope_rescale_coords,
+            )
             if cfg.rope_type == 'mixed':
+                if cfg.rope_rotate_half:
+                    raise ValueError("Mixed RoPE requires rope_rotate_half=False")
                 self.rope = RotaryEmbeddingMixed(
                     cfg.embed_dim,
                     depth=cfg.depth,
@@ -1241,6 +1286,7 @@ class NaFlexVit(nn.Module):
                     temperature=cfg.rope_temperature,
                     feat_shape=None,  # Dynamic shapes for NaFlex
                     grid_indexing=cfg.rope_grid_indexing,
+                    **rope_aug_kwargs,
                     **dd,
                 )
                 self.rope_is_mixed = True
@@ -1251,8 +1297,10 @@ class NaFlexVit(nn.Module):
                     in_pixels=False,
                     feat_shape=None,  # Dynamic shapes for NaFlex
                     ref_feat_shape=cfg.rope_ref_feat_shape,
+                    rotate_half=cfg.rope_rotate_half,
                     grid_offset=cfg.rope_grid_offset,
                     grid_indexing=cfg.rope_grid_indexing,
+                    **rope_aug_kwargs,
                     **dd,
                 )
                 self.rope_is_mixed = False
@@ -1261,8 +1309,10 @@ class NaFlexVit(nn.Module):
                     cfg.embed_dim // cfg.num_heads,
                     temperature=cfg.rope_temperature,
                     feat_shape=None,  # Dynamic shapes for NaFlex
+                    grid_offset=cfg.rope_grid_offset,
                     grid_indexing=cfg.rope_grid_indexing,
                     rotate_half=cfg.rope_rotate_half,
+                    **rope_aug_kwargs,
                     **dd,
                 )
                 self.rope_is_mixed = False
@@ -1273,6 +1323,7 @@ class NaFlexVit(nn.Module):
                     mrope_section=cfg.rope_mrope_section,
                     temperature=cfg.rope_temperature,
                     grid_indexing=cfg.rope_grid_indexing,
+                    **rope_aug_kwargs,
                     **dd,
                 )
                 self.rope_is_mixed = False
@@ -1292,7 +1343,7 @@ class NaFlexVit(nn.Module):
         dpr = calculate_drop_path_rates(cfg.drop_path_rate, cfg.depth)  # stochastic depth decay rule
         # Create transformer blocks
         self.blocks = nn.Sequential(*[
-            block_fn(
+            get_block_fn(cfg, i)(
                 dim=cfg.embed_dim,
                 num_heads=cfg.num_heads,
                 mlp_ratio=cfg.mlp_ratio,
@@ -1319,7 +1370,11 @@ class NaFlexVit(nn.Module):
             for i in range(cfg.depth)
         ]
 
-        self.norm = norm_layer(cfg.embed_dim, **dd) if cfg.final_norm and not cfg.fc_norm else nn.Identity()
+        # Resolve the default before placing the final norm before or after pooling.
+        fc_norm = cfg.fc_norm
+        if fc_norm is None:
+            fc_norm = cfg.global_pool == 'avg'
+        self.norm = norm_layer(cfg.embed_dim, **dd) if cfg.final_norm and not fc_norm else nn.Identity()
 
         # Classifier Head
         if cfg.global_pool == 'map':
@@ -1334,10 +1389,6 @@ class NaFlexVit(nn.Module):
         else:
             self.attn_pool = None
 
-        # Handle fc_norm default value
-        fc_norm = cfg.fc_norm
-        if fc_norm is None:
-            fc_norm = cfg.global_pool == 'avg'
         self.fc_norm = norm_layer(cfg.embed_dim, **dd) if cfg.final_norm and fc_norm else nn.Identity()
         self.head_drop = nn.Dropout(cfg.drop_rate)
         self.head = nn.Linear(self.embed_dim, num_classes, **dd) if num_classes > 0 else nn.Identity()
@@ -1510,8 +1561,8 @@ class NaFlexVit(nn.Module):
                 unique_sizes,
                 B,
                 seq_len,
+                x.device,
                 x.dtype,
-                x.device
             )
 
         # Axial mode: [batch_size, seq_len, dim*2]
@@ -1519,7 +1570,7 @@ class NaFlexVit(nn.Module):
 
         if hasattr(self.rope, 'get_batch_embeds'):
             # Batch mode - generate unique embeds from one grid and then assign
-            unique_embeds = self.rope.get_batch_embeds(unique_sizes)
+            unique_embeds = self.rope.get_batch_embeds(unique_sizes, dtype=x.dtype)
             for grid_size, embed, batch_indices in zip(unique_sizes, unique_embeds, size_to_indices.values()):
                 h, w = grid_size
                 actual_len = h * w
@@ -1529,7 +1580,7 @@ class NaFlexVit(nn.Module):
         else:
             # Generate each unique size separately and assign
             for grid_size, bi in size_to_indices.items():
-                rope_embed = self.rope.get_embed(shape=grid_size)
+                rope_embed = self.rope.get_embed(shape=grid_size, dtype=x.dtype)
                 h, w = grid_size
                 actual_len = h * w
                 rope_embeds[bi, :actual_len] = rope_embed[:actual_len]
@@ -1548,12 +1599,16 @@ class NaFlexVit(nn.Module):
         dd = get_device_dtype(self)
         self.num_classes = num_classes
         if global_pool is not None:
-            assert global_pool in ('', 'avg', 'avgmax', 'max', 'token', 'map')
+            assert global_pool in ('', 'avg', 'avgmax', 'max', 'token', 'map'), \
+                'Only avg, avgmax, max, token or map pooling (or none) is supported.'
+            assert global_pool != 'token' or self.has_class_token, 'Token pooling needs the class token.'
             if global_pool == 'map' and self.attn_pool is None:
                 assert False, "Cannot currently add attention pooling in reset_classifier()."
             elif global_pool != 'map' and self.attn_pool is not None:
                 self.attn_pool = None  # remove attention pooling
             self.global_pool = global_pool
+            # norm placement defaults from global_pool at construction, keep the current one for reconstruction
+            update_model_args(self, fc_norm=not isinstance(self.fc_norm, nn.Identity))
         self.head = nn.Linear(self.embed_dim, num_classes, **dd) if num_classes > 0 else nn.Identity()
         self.head.train(self.training)
 
@@ -1790,6 +1845,31 @@ class NaFlexVit(nn.Module):
 
         return x, intermediates
 
+    def prune_intermediate_layers(
+            self,
+            indices: Union[int, List[int]] = 1,
+            prune_norm: bool = False,
+            prune_head: bool = True,
+    ) -> List[int]:
+        """Prune layers not required for specified intermediates.
+
+        Args:
+            indices: Indices of intermediate layers to keep.
+            prune_norm: Whether to prune normalization layer.
+            prune_head: Whether to prune the classifier head.
+
+        Returns:
+            List of indices that were kept.
+        """
+        take_indices, max_index = feature_take_indices(len(self.blocks), indices)
+        self.blocks = self.blocks[:max_index + 1]  # truncate blocks
+        if prune_norm:
+            self.norm = nn.Identity()
+        if prune_head:
+            self.fc_norm = nn.Identity()
+            self.reset_classifier(0, '')  # also removes attention pooling
+        return take_indices
+
     def forward_features(
             self,
             patches: torch.Tensor,
@@ -1980,6 +2060,8 @@ def get_init_weights_vit(mode: str = 'jax', head_bias: float = 0.0, needs_reset:
 
 def checkpoint_filter_fn(state_dict: Dict[str, Any], model: NaFlexVit) -> Dict[str, Any]:
     """Handle state dict conversion from original ViT to the new version with combined embedding."""
+    if 'radio_model.model.patch_generator.embedder.weight' in state_dict:
+        state_dict = _convert_radio(state_dict)
 
     # Handle CombinedEmbed module pattern
     out_dict = {}
@@ -2070,6 +2152,19 @@ def _cfg(url: str = '', **kwargs) -> Dict[str, Any]:
     }
 
 
+def _radio_cfg(**kwargs) -> Dict[str, Any]:
+    return _cfg(
+        hf_hub_id='timm/',
+        num_classes=0,
+        input_size=(3, 512, 512),
+        mean=OPENAI_CLIP_MEAN,
+        std=OPENAI_CLIP_STD,
+        license='nvidia-open-model-license',
+        origin_url='https://github.com/NVlabs/RADIO',
+        **kwargs,
+    )
+
+
 default_cfgs = generate_default_cfgs({
     'naflexvit_base_patch16_gap.e300_s576_in1k': _cfg(
         hf_hub_id='timm/',
@@ -2091,6 +2186,26 @@ default_cfgs = generate_default_cfgs({
     'naflexvit_so400m_patch16_siglip.v2_webli': _cfg(
         hf_hub_id='timm/',
         num_classes=0),
+
+    # NVIDIA C-RADIO backbones (https://github.com/NVlabs/RADIO), remapped from original NVIDIA HF Hub weights
+    'naflexvit_base_patch16_radio_v3.c_radio': _radio_cfg(
+        # hf_hub_id='nvidia/C-RADIOv3-B', hf_hub_filename='model.safetensors',
+        paper_ids='arXiv:2412.07679'),
+    'naflexvit_large_patch16_radio_v3.c_radio': _radio_cfg(
+        # hf_hub_id='nvidia/C-RADIOv3-L', hf_hub_filename='model.safetensors',
+        paper_ids='arXiv:2412.07679'),
+    'naflexvit_huge_patch16_radio_v3.c_radio': _radio_cfg(
+        # hf_hub_id='nvidia/C-RADIOv3-H', hf_hub_filename='model.safetensors',
+        paper_ids='arXiv:2412.07679'),
+    'naflexvit_giant_patch16_radio_v3.c_radio': _radio_cfg(
+        # hf_hub_id='nvidia/C-RADIOv3-g', hf_hub_filename='model.safetensors',
+        paper_ids='arXiv:2412.07679'),
+    'naflexvit_so400m_patch16_radio_v4.c_radio': _radio_cfg(
+        # hf_hub_id='nvidia/C-RADIOv4-SO400M', hf_hub_filename='model.safetensors',
+        paper_ids='arXiv:2601.17237'),
+    'naflexvit_huge_patch16_radio_v4.c_radio': _radio_cfg(
+        # hf_hub_id='nvidia/C-RADIOv4-H', hf_hub_filename='model.safetensors',
+        paper_ids='arXiv:2601.17237'),
 })
 
 
@@ -2138,9 +2253,9 @@ def _create_naflexvit_from_classic(
 
     # Handle global pooling and fc_norm defaults that differ between ViT and FlexVit
     gp = kwargs.pop('global_pool', 'token')  # Original ViTs default to cls token pooling
-    fc_norm = kwargs.pop('fc_norm', None)    # Original ViTs used fc_norm when not set and avg pooling used
-    if fc_norm is None and gp == 'avg':
-        fc_norm = True
+    fc_norm = kwargs.pop('fc_norm', None)
+    if fc_norm is None:
+        fc_norm = gp in ('avg', 'avgmax', 'max')
 
     # Set FlexVit-specific defaults that differ from VisionTransformer
     flex_kwargs = {
@@ -2177,6 +2292,7 @@ def _create_naflexvit_from_eva(
     """
     # Handle EVA's unique parameters & block args
     kwargs.pop('no_embed_class', None)  # EVA specific, not used in NaFlexVit (always no-embed)
+    kwargs.pop('dynamic_img_size', None)  # NaFlexVit always supports dynamic image sizes
 
     # Map EVA's rope parameters
     use_rot_pos_emb = kwargs.pop('use_rot_pos_emb', False)
@@ -2196,10 +2312,20 @@ def _create_naflexvit_from_eva(
     # Handle norm/pool resolution logic to mirror EVA
     gp = kwargs.pop('global_pool', 'avg')
     use_pre_transformer_norm = kwargs.pop('use_pre_transformer_norm', False)
-    use_post_transformer_norm = kwargs.pop('use_post_transformer_norm', True)
+    use_post_transformer_norm = kwargs.pop('use_post_transformer_norm', None)
     use_fc_norm = kwargs.pop('use_fc_norm', None)
+    # NaFlex overrides, including the placement recorded by reset_classifier, take precedence.
+    use_fc_norm = kwargs.pop('fc_norm', use_fc_norm)
     if use_fc_norm is None:
         use_fc_norm = gp == 'avg'  # default on if avg pool used
+    if use_post_transformer_norm is None:
+        use_post_transformer_norm = not use_fc_norm
+    final_norm = kwargs.pop('final_norm', use_post_transformer_norm or use_fc_norm)
+    if final_norm and use_post_transformer_norm and use_fc_norm:
+        raise ValueError(
+            'NaFlexVit does not support both use_post_transformer_norm=True and use_fc_norm=True; '
+            'use use_naflex=False for this EVA configuration.'
+        )
 
     # Set NaFlexVit-specific parameters
     naflex_kwargs = {
@@ -2208,7 +2334,7 @@ def _create_naflexvit_from_eva(
         'reg_tokens':  kwargs.pop('num_reg_tokens', kwargs.get('reg_tokens', 0)),
         'global_pool': gp,
         'pre_norm': use_pre_transformer_norm,
-        'final_norm': use_post_transformer_norm,
+        'final_norm': final_norm,
         'fc_norm': use_fc_norm,
         'pos_embed': 'learned' if kwargs.pop('use_abs_pos_emb', True) else 'none',
         'rope_type': rope_type,
@@ -2216,7 +2342,7 @@ def _create_naflexvit_from_eva(
         'rope_grid_offset': rope_grid_offset,
         'rope_grid_indexing': rope_grid_indexing,
         'rope_rotate_half': kwargs.pop('rope_rotate_half', False),
-        'rope_ref_feat_shape': kwargs.get('ref_feat_shape', None),
+        'rope_ref_feat_shape': kwargs.pop('ref_feat_shape', None),
         'attn_type': kwargs.pop('attn_type', 'eva'),
         'swiglu_mlp': kwargs.pop('swiglu_mlp', False),
         'qkv_fused': kwargs.pop('qkv_fused', True),
@@ -2383,4 +2509,79 @@ def naflexvit_so400m_patch16_siglip(pretrained: bool = False, **kwargs) -> NaFle
         pos_embed_interp_mode='bilinear',
     )
     model = _create_naflexvit('naflexvit_so400m_patch16_siglip', pretrained=pretrained, cfg=cfg, **kwargs)
+    return model
+
+
+def _radio_vit_cfg(**kwargs) -> NaFlexVitCfg:
+    """ RADIO ViT, pos embed stored on a 128x128 grid (2048px max), bilinearly resized to a square of the
+    largest grid dim then cropped top-left. Per-teacher summary CLS tokens beyond the first are treated as registers.
+
+    NOTE pos_embed_align_corners matches each checkpoint's HF Hub code. All C-RADIOv3 were released w/
+    align_corners=True, the v3-L/g repo code switched to False in 2025-07 (weights unchanged), C-RADIOv4 uses False.
+    """
+    return NaFlexVitCfg(
+        patch_size=16,
+        class_token=True,
+        global_pool='token',
+        final_norm=False,
+        pos_embed_grid_size=(128, 128),
+        pos_embed_interp_mode='bilinear',
+        pos_embed_ar_preserving=True,
+        pos_embed_antialias=False,
+        **kwargs,
+    )
+
+
+@register_model
+def naflexvit_base_patch16_radio_v3(pretrained: bool = False, **kwargs) -> NaFlexVit:
+    """ViT-B/16 C-RADIOv3 backbone.
+    """
+    cfg = _radio_vit_cfg(
+        embed_dim=768, depth=12, num_heads=12, init_values=1e-5, reg_tokens=7, pos_embed_align_corners=True)
+    model = _create_naflexvit('naflexvit_base_patch16_radio_v3', pretrained=pretrained, cfg=cfg, **kwargs)
+    return model
+
+
+@register_model
+def naflexvit_large_patch16_radio_v3(pretrained: bool = False, **kwargs) -> NaFlexVit:
+    """ViT-L/16 C-RADIOv3 backbone.
+    """
+    cfg = _radio_vit_cfg(embed_dim=1024, depth=24, num_heads=16, init_values=1e-5, reg_tokens=7)
+    model = _create_naflexvit('naflexvit_large_patch16_radio_v3', pretrained=pretrained, cfg=cfg, **kwargs)
+    return model
+
+
+@register_model
+def naflexvit_huge_patch16_radio_v3(pretrained: bool = False, **kwargs) -> NaFlexVit:
+    """ViT-H/16 C-RADIOv3 backbone.
+    """
+    cfg = _radio_vit_cfg(embed_dim=1280, depth=32, num_heads=16, reg_tokens=7, pos_embed_align_corners=True)
+    model = _create_naflexvit('naflexvit_huge_patch16_radio_v3', pretrained=pretrained, cfg=cfg, **kwargs)
+    return model
+
+
+@register_model
+def naflexvit_giant_patch16_radio_v3(pretrained: bool = False, **kwargs) -> NaFlexVit:
+    """ViT-g/16 C-RADIOv3 backbone.
+    """
+    cfg = _radio_vit_cfg(embed_dim=1536, depth=40, num_heads=24, reg_tokens=7)
+    model = _create_naflexvit('naflexvit_giant_patch16_radio_v3', pretrained=pretrained, cfg=cfg, **kwargs)
+    return model
+
+
+@register_model
+def naflexvit_so400m_patch16_radio_v4(pretrained: bool = False, **kwargs) -> NaFlexVit:
+    """ViT-SO400M/16 C-RADIOv4 backbone.
+    """
+    cfg = _radio_vit_cfg(embed_dim=1152, depth=27, num_heads=16, mlp_ratio=4304 / 1152, reg_tokens=9)
+    model = _create_naflexvit('naflexvit_so400m_patch16_radio_v4', pretrained=pretrained, cfg=cfg, **kwargs)
+    return model
+
+
+@register_model
+def naflexvit_huge_patch16_radio_v4(pretrained: bool = False, **kwargs) -> NaFlexVit:
+    """ViT-H/16 C-RADIOv4 backbone.
+    """
+    cfg = _radio_vit_cfg(embed_dim=1280, depth=32, num_heads=16, reg_tokens=9)
+    model = _create_naflexvit('naflexvit_huge_patch16_radio_v4', pretrained=pretrained, cfg=cfg, **kwargs)
     return model

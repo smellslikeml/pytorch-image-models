@@ -20,7 +20,18 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from timm.layers import trunc_normal_, DropPath, Mlp, LayerNorm2d, Attention, NormMlpClassifierHead, LayerScale, LayerScale2d, get_device_dtype
+from timm.layers import (
+    trunc_normal_,
+    DropPath,
+    Mlp,
+    LayerNorm2d,
+    Attention,
+    NormMlpClassifierHead,
+    LayerScale,
+    LayerScale2d,
+    get_device_dtype,
+    calculate_drop_path_rates,
+)
 from timm.layers.grn import GlobalResponseNorm
 from timm.models._builder import build_model_with_cfg
 from timm.models._features import feature_take_indices
@@ -102,6 +113,11 @@ def _zigzag_permutation(rows: int, cols: int) -> List[int]:
     return zigzag
 
 
+def _dct_compute_dtype(dtype: Optional[torch.dtype]) -> Optional[torch.dtype]:
+    # fft / linalg.inv don't support low precision, build the kernels in float32 and cast them afterwards
+    return dtype if dtype in (None, torch.float32, torch.float64) else torch.float32
+
+
 def _dct_kernel_type_2(
         kernel_size: int,
         orthonormal: bool,
@@ -109,6 +125,7 @@ def _dct_kernel_type_2(
         dtype=None,
 ) -> torch.Tensor:
     """Generate Type-II DCT kernel matrix."""
+    out_dtype, dtype = dtype, _dct_compute_dtype(dtype)
     dd = dict(device=device, dtype=dtype)
     x = torch.eye(kernel_size, **dd)
     v = x.clone().contiguous().view(-1, kernel_size)
@@ -125,7 +142,7 @@ def _dct_kernel_type_2(
         v[:, 0] = v[:, 0] * torch.sqrt(torch.tensor(1 / (kernel_size * 4), **dd))
         v[:, 1:] = v[:, 1:] * torch.sqrt(torch.tensor(1 / (kernel_size * 2), **dd))
     v = v.contiguous().view(*x.shape)
-    return v
+    return v.to(out_dtype) if out_dtype is not None else v
 
 
 def _dct_kernel_type_3(
@@ -135,7 +152,8 @@ def _dct_kernel_type_3(
         dtype=None,
 ) -> torch.Tensor:
     """Generate Type-III DCT kernel matrix (inverse of Type-II)."""
-    return torch.linalg.inv(_dct_kernel_type_2(kernel_size, orthonormal, device, dtype))
+    v = torch.linalg.inv(_dct_kernel_type_2(kernel_size, orthonormal, device, _dct_compute_dtype(dtype)))
+    return v.to(dtype) if dtype is not None else v
 
 
 class Dct1d(nn.Module):
@@ -549,13 +567,13 @@ class CSATv2(nn.Module):
             dims: Tuple[int, ...] = (32, 72, 168, 386),
             depths: Tuple[int, ...] = (2, 2, 8, 6),
             transformer_depths: Tuple[int, ...] = (0, 0, 2, 2),
+            drop_rate: float = 0.0,
             drop_path_rate: float = 0.0,
             transformer_drop_path: bool = False,
             ls_init_value: Optional[float] = None,
             global_pool: str = 'avg',
             device=None,
             dtype=None,
-            **kwargs,
     ) -> None:
         dd = dict(device=device, dtype=dtype)
         super().__init__()
@@ -570,7 +588,6 @@ class CSATv2(nn.Module):
         self.grad_checkpointing = False
 
         self.num_features = dims[-1]
-        self.head_hidden_size = self.num_features
 
         # Build feature_info dynamically
         self.feature_info = [dict(num_chs=dims[0], reduction=8, module='stem_dct')]
@@ -582,7 +599,7 @@ class CSATv2(nn.Module):
 
         # Build drop path rates for all blocks (0 for transformer blocks when transformer_drop_path=False)
         total_blocks = sum(depths) if transformer_drop_path else sum(d - t for d, t in zip(depths, transformer_depths))
-        dp_iter = iter(torch.linspace(0, drop_path_rate, total_blocks).tolist())
+        dp_iter = iter(calculate_drop_path_rates(drop_path_rate, total_blocks))
         dp_rates = []
         for depth, t_depth in zip(depths, transformer_depths):
             dp_rates += [next(dp_iter) for _ in range(depth - t_depth)]
@@ -607,7 +624,8 @@ class CSATv2(nn.Module):
             stages.append(nn.Sequential(*layers))
         self.stages = nn.Sequential(*stages)
 
-        self.head = NormMlpClassifierHead(dims[-1], num_classes, pool_type=global_pool, **dd)
+        self.head = NormMlpClassifierHead(dims[-1], num_classes, pool_type=global_pool, drop_rate=drop_rate, **dd)
+        self.head_hidden_size = self.head.num_features
 
         # TODO: skip init when on meta device when safe to do so
         self.init_weights(needs_reset=False)
@@ -627,12 +645,19 @@ class CSATv2(nn.Module):
     def get_classifier(self) -> nn.Module:
         return self.head.fc
 
-    def reset_classifier(self, num_classes: int, global_pool: Optional[str] = None) -> None:
+    def reset_classifier(self, num_classes: int, global_pool: Optional[str] = None, reset_other: bool = False) -> None:
         dd = get_device_dtype(self)
         self.num_classes = num_classes
         if global_pool is not None:
             self.global_pool = global_pool
-        self.head.reset(num_classes, pool_type=global_pool, **dd)
+        self.head.reset(
+            num_classes,
+            pool_type=global_pool,
+            reset_other=reset_other,
+            in_features=self.num_features,
+            **dd,
+        )
+        self.head_hidden_size = self.head.num_features
 
     @torch.jit.ignore
     def set_grad_checkpointing(self, enable: bool = True) -> None:
@@ -714,13 +739,17 @@ class CSATv2(nn.Module):
         """
         # 5 feature levels: stem_dct (0) + stages 0-3 (1-4)
         take_indices, max_index = feature_take_indices(len(self.stages) + 1, indices)
+        prune_end = max_index < len(self.stages)
         # max_index is 0-4, stages are 1-4, so we keep max_index stages
         self.stages = self.stages[:max_index] if max_index > 0 else nn.Sequential()
 
         if prune_norm:
             self.head.norm = nn.Identity()
-        if prune_head:
-            self.reset_classifier(0, '')
+        if prune_end:
+            # features now end at the last kept tap, the head is sized for the final features so it goes too
+            self.num_features = self.head_hidden_size = self.feature_info[max_index]['num_chs']
+        if prune_head or prune_end:
+            self.reset_classifier(0, '', reset_other=True)
 
         return take_indices
 
@@ -850,7 +879,6 @@ def _create_csatv2(variant: str, pretrained: bool = False, **kwargs) -> CSATv2:
         pretrained,
         pretrained_filter_fn=checkpoint_filter_fn,
         feature_cfg=dict(out_indices=out_indices, flatten_sequential=True),
-        default_cfg=default_cfgs[variant],
         **kwargs,
     )
 

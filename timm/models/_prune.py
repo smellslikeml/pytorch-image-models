@@ -1,6 +1,7 @@
 import os
 import pkgutil
 from copy import deepcopy
+from typing import Optional
 
 from torch import nn as nn
 
@@ -97,6 +98,9 @@ def adapt_model_from_string(parent_module, model_string):
         input_convs = (input_convs,)
 
     new_module = deepcopy(parent_module)
+    # the classifier takes the pooled features, wider than the final features w/ concat pooling (catavgmax)
+    global_pool = getattr(new_module, 'global_pool', None)
+    feat_mult = global_pool.feat_mult() if hasattr(global_pool, 'feat_mult') else 1
     for n, m in parent_module.named_modules():
         old_module = extract_layer(parent_module, n)
         if isinstance(old_module, nn.Conv2d) or isinstance(old_module, Conv2dSame):
@@ -149,21 +153,80 @@ def adapt_model_from_string(parent_module, model_string):
             # FIXME extra checks to ensure this is actually the FC classifier layer and not a diff Linear layer?
             num_features = state_dict[n + '.weight'][1]
             new_fc = Linear(
-                in_features=num_features,
+                in_features=num_features * feat_mult,
                 out_features=old_module.out_features,
                 bias=old_module.bias is not None,
                 **dd,
             )
             set_layer(new_module, n, new_fc)
             if hasattr(new_module, 'num_features'):
-                if getattr(new_module, 'head_hidden_size', 0) == new_module.num_features:
-                    new_module.head_hidden_size = num_features
+                if getattr(new_module, 'head_hidden_size', 0) == new_module.num_features * feat_mult:
+                    new_module.head_hidden_size = num_features * feat_mult
                 new_module.num_features = num_features
 
     new_module.eval()
     parent_module.eval()
 
+    # The rebuilt layers have new widths, but feature_info still carries the unpruned channel counts.
+    _adapt_feature_info(new_module)
+
+    # Without a Linear classifier (num_classes=0) the feature width isn't adapted above, the final feature is it.
+    old_infos = getattr(parent_module, 'feature_info', None)
+    old_infos = getattr(old_infos, 'info', old_infos)
+    if old_infos and getattr(new_module, 'num_features', None) == old_infos[-1].get('num_chs'):
+        new_infos = getattr(new_module.feature_info, 'info', new_module.feature_info)
+        num_features = new_infos[-1]['num_chs']
+        if getattr(new_module, 'head_hidden_size', 0) == new_module.num_features * feat_mult:
+            new_module.head_hidden_size = num_features * feat_mult
+        new_module.num_features = num_features
+
     return new_module
+
+
+def _module_out_chs(module: nn.Module) -> Optional[int]:
+    """Return the output width of a conv / norm / linear layer, or None for any other module."""
+    if isinstance(module, nn.Conv2d):
+        return module.out_channels
+    if isinstance(module, nn.BatchNorm2d):
+        return module.num_features
+    if isinstance(module, nn.Linear):
+        return module.out_features
+    return None
+
+
+def _adapt_feature_info(module: nn.Module) -> None:
+    """Update ``feature_info`` channel counts in-place to match a pruned module tree.
+
+    Each feature entry names the module producing that feature. After pruning, its output width is the
+    width of the last conv / norm / linear layer registered within it. A parameter-less feature module,
+    such as a stem activation, takes the width of the last such layer registered before it.
+
+    Args:
+        module: Pruned model whose ``feature_info`` (a list of dicts or a ``FeatureInfo``) is updated.
+    """
+    feature_info = getattr(module, 'feature_info', None)
+    infos = getattr(feature_info, 'info', feature_info)
+    if not isinstance(infos, (list, tuple)):
+        return
+    entries = [(i, info['module']) for i, info in enumerate(infos) if isinstance(info, dict) and info.get('module')]
+    before = {}
+    within = {}
+    current = None
+    for name, m in module.named_modules():
+        for i, prefix in entries:
+            if name == prefix:
+                before[i] = current
+        out_chs = _module_out_chs(m)
+        if out_chs is None:
+            continue
+        current = out_chs
+        for i, prefix in entries:
+            if name == prefix or name.startswith(prefix + '.'):
+                within[i] = out_chs
+    for i, _ in entries:
+        num_chs = within.get(i, before.get(i))
+        if num_chs is not None:
+            infos[i]['num_chs'] = num_chs
 
 
 def adapt_model_from_file(parent_module, model_variant):

@@ -2,14 +2,48 @@
 
 A PyTorch implement of Vision Transformers as described in:
 
-'An Image Is Worth 16 x 16 Words: Transformers for Image Recognition at Scale'
-    - https://arxiv.org/abs/2010.11929
+  * `An Image is Worth 16x16 Words: Transformers for Image Recognition at Scale` - https://arxiv.org/abs/2010.11929
+  * `How to train your ViT? Data, Augmentation, and Regularization in Vision Transformers` - https://arxiv.org/abs/2106.10270
+  * `FlexiViT: One Model for All Patch Sizes` - https://arxiv.org/abs/2212.08013
 
-`How to train your ViT? Data, Augmentation, and Regularization in Vision Transformers`
-    - https://arxiv.org/abs/2106.10270
+Papers for additional architecture variants and pretrained weights supported here:
 
-`FlexiViT: One Model for All Patch Sizes`
-    - https://arxiv.org/abs/2212.08013
+  * Architecture variants
+    * `Scaling Vision Transformers` - https://arxiv.org/abs/2106.04560
+    * `Three things everyone should know about Vision Transformers` - https://arxiv.org/abs/2203.09795
+    * `Scaling Vision Transformers to 22 Billion Parameters` - https://arxiv.org/abs/2302.05442
+    * `Getting ViT in Shape: Scaling Laws for Compute-Optimal Model Design` - https://arxiv.org/abs/2305.13035
+    * `Vision Transformers Need Registers` - https://arxiv.org/abs/2309.16588
+    * `Differential Transformer` - https://arxiv.org/abs/2410.05258
+  * Supervised pretrained weights
+    * `When Vision Transformers Outperform ResNets without Pre-training or Strong Data Augmentations` - https://arxiv.org/abs/2106.01548
+    * `ImageNet-21K Pretraining for the Masses` - https://arxiv.org/abs/2104.10972
+  * Self-supervised pretrained weights
+    * `Emerging Properties in Self-Supervised Vision Transformers` - https://arxiv.org/abs/2104.14294
+    * `DINOv2: Learning Robust Visual Features without Supervision` - https://arxiv.org/abs/2304.07193
+    * `Masked Autoencoders Are Scalable Vision Learners` - https://arxiv.org/abs/2111.06377
+    * `Self-Supervised Learning from Images with a Joint-Embedding Predictive Architecture` - https://arxiv.org/abs/2301.08243
+    * `EVA: Exploring the Limits of Masked Visual Representation Learning at Scale` - https://arxiv.org/abs/2211.07636
+    * `Image as a Foreign Language: BEiT Pretraining for All Vision and Vision-Language Tasks` - https://arxiv.org/abs/2208.10442
+    * `Multimodal Autoregressive Pre-training of Large Vision Encoders` - https://arxiv.org/abs/2411.14402
+  * Image-text pretrained weights (CLIP, SigLIP, etc)
+    * `Learning Transferable Visual Models From Natural Language Supervision` - https://arxiv.org/abs/2103.00020
+    * `Reproducible scaling laws for contrastive language-image learning` - https://arxiv.org/abs/2212.07143
+    * `DataComp: In search of the next generation of multimodal datasets` - https://arxiv.org/abs/2304.14108
+    * `Data Filtering Networks` - https://arxiv.org/abs/2309.17425
+    * `Demystifying CLIP Data` - https://arxiv.org/abs/2309.16671
+    * `Altogether: Image Captioning via Re-aligning Alt-text` - https://arxiv.org/abs/2410.17251
+    * `Meta CLIP 2: A Worldwide Scaling Recipe` - https://arxiv.org/abs/2507.22062
+    * `TinyCLIP: CLIP Distillation via Affinity Mimicking and Weight Inheritance` - https://arxiv.org/abs/2309.12314
+    * `MobileCLIP2: Improving Multi-Modal Reinforced Training` - https://arxiv.org/abs/2508.20691
+    * `Sigmoid Loss for Language Image Pre-Training` - https://arxiv.org/abs/2303.15343
+    * `SigLIP 2: Multilingual Vision-Language Encoders with Improved Semantic Understanding, Localization, and Dense Features` - https://arxiv.org/abs/2502.14786
+    * `PaliGemma: A versatile 3B VLM for transfer` - https://arxiv.org/abs/2407.07726
+    * `PaliGemma 2: A Family of Versatile VLMs for Transfer` - https://arxiv.org/abs/2412.03555
+    * `TIPSv2: Advancing Vision-Language Pretraining with Enhanced Patch-Text Alignment` - https://arxiv.org/abs/2604.12012
+  * InternViT pretrained weights
+    * `Mini-InternVL: A Flexible-Transfer Pocket Multimodal Model with 5% Parameters and 90% Performance` - https://arxiv.org/abs/2410.16261
+    * `Expanding Performance Boundaries of Open-Source Multimodal Models with Model, Data, and Test-Time Scaling` - https://arxiv.org/abs/2412.05271
 
 The official jax code is released and available at
   * https://github.com/google-research/vision_transformer
@@ -73,6 +107,7 @@ from timm.layers import (
     LayerType,
     LayerScale,
 )
+from ._input import get_pretrained_grid_size, update_model_args, update_model_input_size
 from ._builder import build_model_with_cfg
 from ._features import feature_take_indices
 from ._helpers import _load_npz_checkpoint
@@ -797,8 +832,9 @@ class VisionTransformer(nn.Module):
         """
         super().__init__()
         dd = {'device': device, 'dtype': dtype}
-        assert global_pool in ('', 'avg', 'avgmax', 'max', 'token', 'map', 'prr')
-        assert class_token or global_pool != 'token'
+        assert global_pool in ('', 'avg', 'avgmax', 'max', 'token', 'map', 'prr'), \
+            'Only avg, avgmax, max, token, map or prr pooling (or none) is supported.'
+        assert class_token or global_pool != 'token', 'Token pooling needs the class token.'
         assert pos_embed in ('', 'none', 'learn')
         use_fc_norm = global_pool in ('avg', 'avgmax', 'max') if fc_norm is None else fc_norm
         norm_layer = get_norm_layer(norm_layer) or LayerNorm
@@ -977,7 +1013,7 @@ class VisionTransformer(nn.Module):
             Dictionary mapping group names to regex patterns.
         """
         return dict(
-            stem=r'^cls_token|reg_token|pos_embed|patch_embed',  # stem and embed
+            stem=r'^cls_token|reg_token|pos_embed|patch_embed|norm_pre',  # stem and embed
             blocks=[(r'^blocks\.(\d+)', None), (r'^norm', (99999,))]
         )
 
@@ -1007,7 +1043,9 @@ class VisionTransformer(nn.Module):
         dd = get_device_dtype(self)
         self.num_classes = num_classes
         if global_pool is not None:
-            assert global_pool in ('', 'avg', 'avgmax', 'max', 'token', 'map', 'prr')
+            assert global_pool in ('', 'avg', 'avgmax', 'max', 'token', 'map', 'prr'), \
+                'Only avg, avgmax, max, token, map or prr pooling (or none) is supported.'
+            assert global_pool != 'token' or self.has_class_token, 'Token pooling needs the class token.'
             if global_pool in ('map', 'prr') and self.attn_pool is None:
                 assert False, "Cannot currently add attention pooling in reset_classifier()."
             elif global_pool not in ('map', 'prr') and self.attn_pool is not None:
@@ -1015,6 +1053,8 @@ class VisionTransformer(nn.Module):
             elif global_pool in ('map', 'prr') and self.global_pool != global_pool:
                 assert False, "Cannot currently change attention pooling type in reset_classifier()."
             self.global_pool = global_pool
+            # norm placement defaults from global_pool at construction, keep the current one for reconstruction
+            update_model_args(self, fc_norm=not isinstance(self.fc_norm, nn.Identity))
         self.head = nn.Linear(self.embed_dim, num_classes, **dd) if num_classes > 0 else nn.Identity()
         self.head.train(self.training)
 
@@ -1034,14 +1074,16 @@ class VisionTransformer(nn.Module):
         if self.pos_embed is not None:
             num_prefix_tokens = 0 if self.no_embed_class else self.num_prefix_tokens
             num_new_tokens = self.patch_embed.num_patches + num_prefix_tokens
-            if num_new_tokens != self.pos_embed.shape[1]:
+            if num_new_tokens != self.pos_embed.shape[1] or self.patch_embed.grid_size != prev_grid_size:
                 self.pos_embed = nn.Parameter(resample_abs_pos_embed(
                     self.pos_embed,
                     new_size=self.patch_embed.grid_size,
                     old_size=prev_grid_size,
                     num_prefix_tokens=num_prefix_tokens,
                     verbose=True,
-                ))
+                ), requires_grad=self.pos_embed.requires_grad)
+
+        update_model_input_size(self, self.patch_embed.img_size, patch_size=patch_size)
 
     def _pos_embed(self, x: torch.Tensor) -> torch.Tensor:
         """Apply positional embedding to input."""
@@ -1837,12 +1879,62 @@ def _convert_beit3(state_dict: dict, model):
     return out
 
 
+def _convert_radio(
+        state_dict: Dict[str, torch.Tensor],
+        model: Optional[VisionTransformer] = None,
+        interpolation: str = 'bilinear',
+        antialias: bool = False,
+        align_corners: Optional[bool] = None,
+) -> Dict[str, torch.Tensor]:
+    """Remap NVIDIA RADIO (C-RADIOv3 / v4) backbone weights to timm ViT keys.
+
+    Input conditioner (mean / std), summary indices and teacher adaptor heads are dropped. If a model is passed,
+    RADIO's 128x128 CPE pos embed grid is resampled to the model's fixed grid size as RADIO does at inference,
+    resized to a square of the largest grid dim then cropped top-left.
+    """
+    out_dict = {}
+    prefix = 'radio_model.model.'
+    for k, v in state_dict.items():
+        if not k.startswith(prefix):
+            continue
+        k = k[len(prefix):]
+        if k == 'patch_generator.embedder.weight':
+            # bias-free linear projection of (C, ph, pw) flattened patches -> conv weight w/ zero bias
+            p = int(math.sqrt(v.shape[1] // 3))
+            out_dict['patch_embed.proj.weight'] = v.reshape(v.shape[0], 3, p, p)
+            out_dict['patch_embed.proj.bias'] = v.new_zeros(v.shape[0])
+        elif k == 'patch_generator.pos_embed':
+            out_dict['pos_embed'] = v
+        elif k == 'patch_generator.cls_token.token':
+            # one CLS token per teacher followed by registers, first CLS is the cls_token, rest act as registers
+            out_dict['cls_token'] = v[None, :1]
+            out_dict['reg_token'] = v[None, 1:]
+        elif k.startswith('blocks.'):
+            out_dict[k.replace('.grandma', '.gamma')] = v
+
+    if model is not None and model.pos_embed is not None and 'pos_embed' in out_dict:
+        grid_size = model.patch_embed.grid_size
+        max_size = max(grid_size)
+        pos_embed = resample_abs_pos_embed(
+            out_dict['pos_embed'],
+            new_size=(max_size, max_size),
+            num_prefix_tokens=0,
+            interpolation=interpolation,
+            antialias=antialias,
+            align_corners=align_corners,
+        )
+        pos_embed = pos_embed.reshape(1, max_size, max_size, -1)[:, :grid_size[0], :grid_size[1]]
+        out_dict['pos_embed'] = pos_embed.reshape(1, grid_size[0] * grid_size[1], -1)
+    return out_dict
+
+
 def checkpoint_filter_fn(
         state_dict: Dict[str, torch.Tensor],
         model: VisionTransformer,
         adapt_layer_scale: bool = False,
         interpolation: str = 'bicubic',
         antialias: bool = True,
+        align_corners: Optional[bool] = None,
 ) -> Dict[str, torch.Tensor]:
     """ convert patch embedding weight from manual patchify + linear proj to conv"""
     import re
@@ -1850,6 +1942,7 @@ def checkpoint_filter_fn(
     state_dict = state_dict.get('model', state_dict)
     state_dict = state_dict.get('state_dict', state_dict)
     prefix = ''
+    resample_pos_embed = True
 
     if 'visual.class_embedding' in state_dict:
         state_dict = _convert_openai_clip(state_dict, model)
@@ -1880,6 +1973,10 @@ def checkpoint_filter_fn(
         prefix = 'module.visual.trunk.'
     elif 'preprocessor.patchifier.proj.weight' in state_dict:
         state_dict = _convert_aimv2(state_dict, model)
+    elif 'radio_model.model.patch_generator.embedder.weight' in state_dict:
+        state_dict = _convert_radio(
+            state_dict, model, interpolation=interpolation, antialias=antialias, align_corners=align_corners)
+        resample_pos_embed = False  # already resampled to the model's grid
 
     if prefix:
         # filter on & remove prefix string from keys
@@ -1900,17 +1997,26 @@ def checkpoint_filter_fn(
                     antialias=antialias,
                     verbose=True,
                 )
-        elif k == 'pos_embed' and v.shape[1] != model.pos_embed.shape[1]:
-            # To resize pos embedding when using model at different size from pretrained weights
+        elif k == 'pos_embed' and model.pos_embed is not None and resample_pos_embed:
             num_prefix_tokens = 0 if getattr(model, 'no_embed_class', False) else getattr(model, 'num_prefix_tokens', 1)
-            v = resample_abs_pos_embed(
-                v,
-                new_size=model.patch_embed.grid_size,
-                num_prefix_tokens=num_prefix_tokens,
-                interpolation=interpolation,
-                antialias=antialias,
-                verbose=True,
+            old_size = get_pretrained_grid_size(
+                model,
+                state_dict.get('patch_embed.proj.weight'),
+                v.shape[1] - num_prefix_tokens,
             )
+            if v.shape[1] != model.pos_embed.shape[1] or (
+                old_size is not None and old_size != model.patch_embed.grid_size
+            ):
+                v = resample_abs_pos_embed(
+                    v,
+                    new_size=model.patch_embed.grid_size,
+                    old_size=old_size,
+                    num_prefix_tokens=num_prefix_tokens,
+                    interpolation=interpolation,
+                    antialias=antialias,
+                    verbose=True,
+                    align_corners=align_corners,
+                )
         elif adapt_layer_scale and 'gamma_' in k:
             # remap layer-scale gamma into sub-module (deit3 models)
             k = re.sub(r'gamma_([0-9])', r'ls\1.gamma', k)
@@ -2102,6 +2208,12 @@ default_cfgs = {
     'vit_base_patch16_224.sam_in1k': _cfg(
         url='https://storage.googleapis.com/vit_models/sam/ViT-B_16.npz', custom_load=True,
         hf_hub_id='timm/'),
+
+    # Bamboo-CLS classifier, using the upstream benchmark preprocessing.
+    'vit_base_patch16_224.bamboo': _cfg(
+        hf_hub_id='timm/', num_classes=115217, crop_pct=1.0,
+        mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD,
+        license=None, origin_url='https://github.com/ZhangYuanhan-AI/Bamboo', paper_ids='arXiv:2203.07845'),
 
     # DINO pretrained - https://arxiv.org/abs/2104.14294 (no classifier head, for fine-tune only)
     'vit_small_patch16_224.dino': _cfg(
@@ -3173,6 +3285,50 @@ default_cfgs = {
         mean=IMAGENET_DEFAULT_MEAN, std=IMAGENET_DEFAULT_STD, crop_pct=1.0,
         num_classes=0,
     ),
+
+    # NVIDIA C-RADIO backbones (https://github.com/NVlabs/RADIO), remapped from original NVIDIA HF Hub weights
+    'vit_base_patch16_radio_v3.c_radio': _cfg(
+        hf_hub_id='timm/',
+        # hf_hub_id='nvidia/C-RADIOv3-B', hf_hub_filename='model.safetensors',  # original NVIDIA weights
+        paper_ids='arXiv:2412.07679', origin_url='https://github.com/NVlabs/RADIO', license='nvidia-open-model-license',
+        mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD, input_size=(3, 512, 512), crop_pct=1.0,
+        num_classes=0,
+    ),
+    'vit_large_patch16_radio_v3.c_radio': _cfg(
+        hf_hub_id='timm/',
+        # hf_hub_id='nvidia/C-RADIOv3-L', hf_hub_filename='model.safetensors',  # original NVIDIA weights
+        paper_ids='arXiv:2412.07679', origin_url='https://github.com/NVlabs/RADIO', license='nvidia-open-model-license',
+        mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD, input_size=(3, 512, 512), crop_pct=1.0,
+        num_classes=0,
+    ),
+    'vit_huge_patch16_radio_v3.c_radio': _cfg(
+        hf_hub_id='timm/',
+        # hf_hub_id='nvidia/C-RADIOv3-H', hf_hub_filename='model.safetensors',  # original NVIDIA weights
+        paper_ids='arXiv:2412.07679', origin_url='https://github.com/NVlabs/RADIO', license='nvidia-open-model-license',
+        mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD, input_size=(3, 512, 512), crop_pct=1.0,
+        num_classes=0,
+    ),
+    'vit_giant_patch16_radio_v3.c_radio': _cfg(
+        hf_hub_id='timm/',
+        # hf_hub_id='nvidia/C-RADIOv3-g', hf_hub_filename='model.safetensors',  # original NVIDIA weights
+        paper_ids='arXiv:2412.07679', origin_url='https://github.com/NVlabs/RADIO', license='nvidia-open-model-license',
+        mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD, input_size=(3, 512, 512), crop_pct=1.0,
+        num_classes=0,
+    ),
+    'vit_so400m_patch16_radio_v4.c_radio': _cfg(
+        hf_hub_id='timm/',
+        # hf_hub_id='nvidia/C-RADIOv4-SO400M', hf_hub_filename='model.safetensors',  # original NVIDIA weights
+        paper_ids='arXiv:2601.17237', origin_url='https://github.com/NVlabs/RADIO', license='nvidia-open-model-license',
+        mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD, input_size=(3, 512, 512), crop_pct=1.0,
+        num_classes=0,
+    ),
+    'vit_huge_patch16_radio_v4.c_radio': _cfg(
+        hf_hub_id='timm/',
+        # hf_hub_id='nvidia/C-RADIOv4-H', hf_hub_filename='model.safetensors',  # original NVIDIA weights
+        paper_ids='arXiv:2601.17237', origin_url='https://github.com/NVlabs/RADIO', license='nvidia-open-model-license',
+        mean=OPENAI_CLIP_MEAN, std=OPENAI_CLIP_STD, input_size=(3, 512, 512), crop_pct=1.0,
+        num_classes=0,
+    ),
 }
 
 _quick_gelu_cfgs = [n for n, c in default_cfgs.items() if c.get('notes', ()) and 'quickgelu' in c['notes'][0]]
@@ -3188,6 +3344,11 @@ default_cfgs = generate_default_cfgs(default_cfgs)
 # Global flag to use NaFlexVit instead of VisionTransformer
 _USE_NAFLEX_DEFAULT = os.environ.get('TIMM_USE_NAFLEXVIT', 'false').lower() == 'true'
 
+# RADIO pos embed resize align_corners matches each checkpoint's HF Hub code. All C-RADIOv3 were released w/
+# align_corners=True, the v3-L/g repo code switched to False in 2025-07 (weights unchanged), C-RADIOv4 uses False.
+_RADIO_ALIGN_CORNERS = ('base_patch16_radio_v3', 'huge_patch16_radio_v3')
+
+
 def _create_vision_transformer(
         variant: str,
         pretrained: bool = False,
@@ -3197,9 +3358,20 @@ def _create_vision_transformer(
     # Check if we should use NaFlexVit instead
     if use_naflex is None:
         use_naflex = _USE_NAFLEX_DEFAULT
+    radio_align_corners = any(n in variant for n in _RADIO_ALIGN_CORNERS)
     if use_naflex:
         # Import here to avoid circular imports
         from .naflexvit import _create_naflexvit_from_classic
+        if 'radio' in variant:
+            # keep RADIO's full pos embed grid and resize behaviour, as per naflexvit_*_radio_* models
+            kwargs = {
+                'pos_embed_grid_size': (128, 128),
+                'pos_embed_interp_mode': 'bilinear',
+                'pos_embed_ar_preserving': True,
+                'pos_embed_antialias': False,
+                'pos_embed_align_corners': radio_align_corners,
+                **kwargs,
+            }
         return _create_naflexvit_from_classic(variant, pretrained, **kwargs)
 
     out_indices = kwargs.pop('out_indices', 3)
@@ -3207,6 +3379,14 @@ def _create_vision_transformer(
         # FIXME Google FlexiViT pretrained models have a strong preference for bilinear patch / embed
         # interpolation, other pretrained models resize better w/ anti-aliased bicubic interpolation.
         _filter_fn = partial(checkpoint_filter_fn, interpolation='bilinear', antialias=False)
+    elif 'radio' in variant:
+        # RADIO pos embed is resampled bilinear w/o antialias
+        _filter_fn = partial(
+            checkpoint_filter_fn,
+            interpolation='bilinear',
+            antialias=False,
+            align_corners=radio_align_corners,
+        )
     else:
         _filter_fn = checkpoint_filter_fn
 
@@ -5020,6 +5200,87 @@ def beit3_giant_patch14_336(pretrained: bool = False, **kwargs) -> VisionTransfo
         norm_layer=partial(LayerNorm, eps=1e-5),
     )
     model = _create_vision_transformer('beit3_giant_patch14_336', pretrained=pretrained, **dict(model_args, **kwargs))
+    return model
+
+
+@register_model
+def vit_base_patch16_radio_v3(pretrained: bool = False, **kwargs) -> VisionTransformer:
+    """ ViT-B/16 C-RADIOv3 backbone. Pos embed is resampled from RADIO's 128x128 grid to the model's fixed grid at
+    weight load, use naflexvit_base_patch16_radio_v3 for RADIO's exact behaviour at all resolutions.
+    """
+    model_args = dict(
+        img_size=512, patch_size=16, embed_dim=768, depth=12, num_heads=12, init_values=1e-5, reg_tokens=7,
+        no_embed_class=True, final_norm=False,
+    )
+    model = _create_vision_transformer('vit_base_patch16_radio_v3', pretrained=pretrained, **dict(model_args, **kwargs))
+    return model
+
+
+@register_model
+def vit_large_patch16_radio_v3(pretrained: bool = False, **kwargs) -> VisionTransformer:
+    """ ViT-L/16 C-RADIOv3 backbone. Pos embed is resampled from RADIO's 128x128 grid to the model's fixed grid at
+    weight load, use naflexvit_large_patch16_radio_v3 for RADIO's exact behaviour at all resolutions.
+    """
+    model_args = dict(
+        img_size=512, patch_size=16, embed_dim=1024, depth=24, num_heads=16, init_values=1e-5, reg_tokens=7,
+        no_embed_class=True, final_norm=False,
+    )
+    model = _create_vision_transformer(
+        'vit_large_patch16_radio_v3', pretrained=pretrained, **dict(model_args, **kwargs))
+    return model
+
+
+@register_model
+def vit_huge_patch16_radio_v3(pretrained: bool = False, **kwargs) -> VisionTransformer:
+    """ ViT-H/16 C-RADIOv3 backbone. Pos embed is resampled from RADIO's 128x128 grid to the model's fixed grid at
+    weight load, use naflexvit_huge_patch16_radio_v3 for RADIO's exact behaviour at all resolutions.
+    """
+    model_args = dict(
+        img_size=512, patch_size=16, embed_dim=1280, depth=32, num_heads=16, reg_tokens=7,
+        no_embed_class=True, final_norm=False,
+    )
+    model = _create_vision_transformer('vit_huge_patch16_radio_v3', pretrained=pretrained, **dict(model_args, **kwargs))
+    return model
+
+
+@register_model
+def vit_giant_patch16_radio_v3(pretrained: bool = False, **kwargs) -> VisionTransformer:
+    """ ViT-g/16 C-RADIOv3 backbone. Pos embed is resampled from RADIO's 128x128 grid to the model's fixed grid at
+    weight load, use naflexvit_giant_patch16_radio_v3 for RADIO's exact behaviour at all resolutions.
+    """
+    model_args = dict(
+        img_size=512, patch_size=16, embed_dim=1536, depth=40, num_heads=24, reg_tokens=7,
+        no_embed_class=True, final_norm=False,
+    )
+    model = _create_vision_transformer(
+        'vit_giant_patch16_radio_v3', pretrained=pretrained, **dict(model_args, **kwargs))
+    return model
+
+
+@register_model
+def vit_so400m_patch16_radio_v4(pretrained: bool = False, **kwargs) -> VisionTransformer:
+    """ ViT-SO400M/16 C-RADIOv4 backbone. Pos embed is resampled from RADIO's 128x128 grid to the model's fixed grid at
+    weight load, use naflexvit_so400m_patch16_radio_v4 for RADIO's exact behaviour at all resolutions.
+    """
+    model_args = dict(
+        img_size=512, patch_size=16, embed_dim=1152, depth=27, num_heads=16, mlp_ratio=4304 / 1152, reg_tokens=9,
+        no_embed_class=True, final_norm=False,
+    )
+    model = _create_vision_transformer(
+        'vit_so400m_patch16_radio_v4', pretrained=pretrained, **dict(model_args, **kwargs))
+    return model
+
+
+@register_model
+def vit_huge_patch16_radio_v4(pretrained: bool = False, **kwargs) -> VisionTransformer:
+    """ ViT-H/16 C-RADIOv4 backbone. Pos embed is resampled from RADIO's 128x128 grid to the model's fixed grid at
+    weight load, use naflexvit_huge_patch16_radio_v4 for RADIO's exact behaviour at all resolutions.
+    """
+    model_args = dict(
+        img_size=512, patch_size=16, embed_dim=1280, depth=32, num_heads=16, reg_tokens=9,
+        no_embed_class=True, final_norm=False,
+    )
+    model = _create_vision_transformer('vit_huge_patch16_radio_v4', pretrained=pretrained, **dict(model_args, **kwargs))
     return model
 
 

@@ -1,5 +1,8 @@
 """ EfficientFormer-V2
 
+Papers:
+* `Rethinking Vision Transformers for MobileNet Size and Speed` - https://arxiv.org/abs/2212.08059
+
 @article{
     li2022rethinking,
     title={Rethinking Vision Transformers for MobileNet Size and Speed},
@@ -166,8 +169,12 @@ class Attention2d(torch.nn.Module):
     @torch.no_grad()
     def train(self, mode=True):
         super().train(mode)
-        if mode and self.attention_bias_cache:
+        if self.attention_bias_cache:
             self.attention_bias_cache = {}  # clear ab cache
+
+    def _apply(self, fn, *args, **kwargs):
+        self.attention_bias_cache = {}
+        return super()._apply(fn, *args, **kwargs)
 
     def reset_parameters(self) -> None:
         """Initialize parameters and buffers."""
@@ -307,8 +314,12 @@ class Attention2dDownsample(torch.nn.Module):
     @torch.no_grad()
     def train(self, mode=True):
         super().train(mode)
-        if mode and self.attention_bias_cache:
+        if self.attention_bias_cache:
             self.attention_bias_cache = {}  # clear ab cache
+
+    def _apply(self, fn, *args, **kwargs):
+        self.attention_bias_cache = {}
+        return super()._apply(fn, *args, **kwargs)
 
     def reset_parameters(self) -> None:
         """Initialize parameters and buffers."""
@@ -664,7 +675,7 @@ class EfficientFormerV2(nn.Module):
     ):
         super().__init__()
         dd = {'device': device, 'dtype': dtype}
-        assert global_pool in ('avg', '')
+        assert global_pool in ('avg', ''), 'Only avg pooling (or none) is supported.'
         self.num_classes = num_classes
         self.in_chans = in_chans
         self.global_pool = global_pool
@@ -761,11 +772,13 @@ class EfficientFormerV2(nn.Module):
         dd = get_device_dtype(self)
         self.num_classes = num_classes
         if global_pool is not None:
+            assert global_pool in ('', 'avg'), 'Only avg pooling (or none) is supported.'
             self.global_pool = global_pool
         self.head = nn.Linear(self.num_features, num_classes, **dd) if num_classes > 0 else nn.Identity()
         self.head.train(self.training)
-        self.head_dist = nn.Linear(self.num_features, num_classes, **dd) if num_classes > 0 else nn.Identity()
-        self.head_dist.train(self.training)
+        if self.head_dist is not None:
+            self.head_dist = nn.Linear(self.num_features, num_classes, **dd) if num_classes > 0 else nn.Identity()
+            self.head_dist.train(self.training)
 
     @torch.jit.ignore
     def set_distilled_training(self, enable=True):
@@ -831,10 +844,14 @@ class EfficientFormerV2(nn.Module):
         """ Prune layers not required for specified intermediates.
         """
         take_indices, max_index = feature_take_indices(len(self.stages), indices)
+        prune_end = max_index < len(self.stages) - 1
+        if prune_norm or prune_end:
+            self.norm = nn.Identity()  # final norm is sized for (and only applied to) the last stage
         self.stages = self.stages[:max_index + 1]  # truncate blocks w/ stem as idx 0
-        if prune_norm:
-            self.norm = nn.Identity()
-        if prune_head:
+        if prune_end:
+            # features now end at the last kept tap, the head is sized for the final features so it goes too
+            self.num_features = self.head_hidden_size = self.feature_info[max_index]['num_chs']
+        if prune_head or prune_end:
             self.reset_classifier(0, '')
         return take_indices
 
@@ -850,6 +867,8 @@ class EfficientFormerV2(nn.Module):
         x = self.head_drop(x)
         if pre_logits:
             return x
+        if self.head_dist is None:
+            return self.head(x)
         x, x_dist = self.head(x), self.head_dist(x)
         if self.distilled_training and self.training and not torch.jit.is_scripting():
             # only return separate classification predictions when training in distilled mode

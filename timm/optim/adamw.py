@@ -13,7 +13,10 @@ import torch
 from torch import Tensor
 from torch.optim.optimizer import Optimizer
 
-from ._helpers import _check_capturable_devices, _get_value, _init_scalar
+from ._helpers import (
+    _check_capturable_devices, _foreach_chunked, _foreach_increment_steps, _foreach_lerp_, _foreach_rms_clip_denom_,
+    _get_value, _init_scalar, _is_compiling, _max_lr_snapshot, _resolve_foreach, _rms_clip_denom_,
+)
 from ._types import ParamsT
 
 
@@ -44,6 +47,11 @@ class AdamWLegacy(Optimizer):
         capturable: whether this instance is safe to capture in a CUDA graph.
             Passing True can impair ungraphed performance, so if you don't intend to
             graph capture this instance, leave it False
+        clipping_threshold: RMS update clipping threshold (StableAdamW, https://arxiv.org/abs/2304.13013), the
+            update is scaled by 1 / max(1, rms / clipping_threshold) w/ rms the RMS of grad / (sqrt(v_hat) + eps).
+            Damps the update of params w/ a sudden gradient increase relative to their second moment estimate.
+            1.0 as per the paper, None (default) disables. As in Adafactor, the decoupled weight decay is not clipped
+            (StableAdamW also scales the decay by the clipped lr).
     """
 
     def __init__(
@@ -59,6 +67,7 @@ class AdamWLegacy(Optimizer):
             maximize: bool = False,
             foreach: Optional[bool] = None,
             capturable: bool = False,
+            clipping_threshold: Optional[float] = None,
     ):
         if not 0.0 <= lr:
             raise ValueError("Invalid learning rate: {}".format(lr))
@@ -76,21 +85,26 @@ class AdamWLegacy(Optimizer):
             amsgrad=amsgrad,
             caution=caution,
             corrected_weight_decay=corrected_weight_decay,
+            max_lr_snapshot=_max_lr_snapshot(lr, corrected_weight_decay),
             foreach=foreach,
             maximize=maximize,
             capturable=capturable,
+            clipping_threshold=clipping_threshold,
         )
         super(AdamWLegacy, self).__init__(params, defaults)
 
     def __setstate__(self, state):
         super(AdamWLegacy, self).__setstate__(state)
+        self.defaults.setdefault('max_lr_snapshot', _max_lr_snapshot(self.defaults['lr']))  # pickled pre-snapshot
         for group in self.param_groups:
             group.setdefault('amsgrad', False)
             group.setdefault('caution', False)
             group.setdefault('corrected_weight_decay', False)
+            group.setdefault('max_lr_snapshot', self.defaults['max_lr_snapshot'])
             group.setdefault('foreach', None)
             group.setdefault('maximize', False)
             group.setdefault('capturable', False)
+            group.setdefault('clipping_threshold', None)
             for p in group['params']:
                 p_state = self.state.get(p, {})
                 if p_state and 'step' in p_state:
@@ -171,7 +185,8 @@ class AdamWLegacy(Optimizer):
                 caution=group['caution'],
                 maximize=group['maximize'],
                 capturable=group['capturable'],
-                max_lr=self.defaults['lr'] if group['corrected_weight_decay'] else None,
+                max_lr=group['max_lr_snapshot'] if group['corrected_weight_decay'] else None,
+                clipping_threshold=group['clipping_threshold'],
             )
 
         return loss
@@ -196,6 +211,7 @@ def adamw(
         caution: bool,
         maximize: bool,
         max_lr: Optional[float],
+        clipping_threshold: Optional[float] = None,
 ) -> None:
     r"""Functional API that performs AdamW algorithm computation.
       See AdamWLegacy class for details.
@@ -206,15 +222,8 @@ def adamw(
             'API has changed, `state_steps` argument must contain a list of' +
             ' singleton tensors')
 
-    if foreach is None:
-        try:
-            # cannot do foreach if this overload doesn't exist when caution enabled
-            foreach = not caution or 'Scalar' in torch.ops.aten._foreach_maximum_.overloads()
-            # Match native PyTorch: tensor lr without capturable mode is supported by the single-tensor path.
-            if foreach and torch.is_tensor(lr) and not capturable:
-                foreach = False
-        except Exception:
-            foreach = False
+    # Match native PyTorch: tensor lr without capturable mode is supported by the single-tensor path.
+    foreach = _resolve_foreach(foreach, caution, lr=None if capturable else lr, params=params)
 
     if foreach and not torch.jit.is_scripting():
         func = _multi_tensor_adamw
@@ -238,6 +247,7 @@ def adamw(
         maximize=maximize,
         capturable=capturable,
         max_lr=max_lr,
+        clipping_threshold=clipping_threshold,
     )
 
 
@@ -259,6 +269,7 @@ def _single_tensor_adamw(
         maximize: bool,
         capturable: bool,
         max_lr: Optional[float],
+        clipping_threshold: Optional[float] = None,
 ):
     if capturable:
         _check_capturable_devices(params, state_steps)
@@ -269,6 +280,14 @@ def _single_tensor_adamw(
         exp_avg_sq = exp_avg_sqs[i]
         step_t = state_steps[i]
 
+        if torch.is_complex(param):
+            grad = torch.view_as_real(grad)
+            exp_avg = torch.view_as_real(exp_avg)
+            exp_avg_sq = torch.view_as_real(exp_avg_sq)
+            if amsgrad:
+                max_exp_avg_sqs[i] = torch.view_as_real(max_exp_avg_sqs[i])
+            param = torch.view_as_real(param)
+
         # Update step.
         step_t += 1
 
@@ -277,7 +296,7 @@ def _single_tensor_adamw(
         param.mul_(1. - wd_scale * weight_decay)
 
         # Decay the first and second moment running average coefficient.
-        exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
+        exp_avg.lerp_(grad, 1 - beta1)
         exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
 
         if amsgrad:
@@ -301,7 +320,15 @@ def _single_tensor_adamw(
 
             bias_correction2_sqrt = bias_correction2.sqrt()
 
-            denom = (denom_base.sqrt() / (bias_correction2_sqrt * step_size_neg)).add_(eps / step_size_neg)
+            # add eps before dividing by the (negative) step size, as in the non-capturable path. Dividing eps by
+            # the step size first gives 0 / 0 = NaN when lr == 0. NOTE eps must be representable in the param dtype.
+            denom = (denom_base.sqrt() / bias_correction2_sqrt).add_(eps)
+            if clipping_threshold is not None:
+                _rms_clip_denom_(denom, grad, clipping_threshold)
+            if denom.dtype == torch.float16:
+                # avoid FP16 overflow when folding in small step sizes
+                denom = denom.float()
+            denom.div_(step_size_neg)
 
             if caution:
                 # Apply caution as per 'Cautious Optimizers' - https://arxiv.org/abs/2411.16085
@@ -319,6 +346,8 @@ def _single_tensor_adamw(
             bias_correction2_sqrt = bias_correction2 ** 0.5
 
             denom = (denom_base.sqrt() / bias_correction2_sqrt).add_(eps)
+            if clipping_threshold is not None:
+                _rms_clip_denom_(denom, grad, clipping_threshold)
 
             if caution:
                 # Apply caution as per 'Cautious Optimizers' - https://arxiv.org/abs/2411.16085
@@ -329,6 +358,7 @@ def _single_tensor_adamw(
             param.addcdiv_(exp_avg, denom, value=-step_size)
 
 
+@_foreach_chunked(6)
 def _multi_tensor_adamw(
         params: List[Tensor],
         grads: List[Tensor],
@@ -347,6 +377,7 @@ def _multi_tensor_adamw(
         maximize: bool,
         capturable: bool,
         max_lr: Optional[float],
+        clipping_threshold: Optional[float] = None,
 ):
     if len(params) == 0:
         return
@@ -363,16 +394,14 @@ def _multi_tensor_adamw(
     params = [torch.view_as_real(x) if torch.is_complex(x) else x for x in params]
 
     # update steps
-    torch._foreach_add_(state_steps, 1)
+    _foreach_increment_steps(state_steps)
 
     # Perform stepweight decay
     wd_scale = lr if max_lr is None else lr ** 2 / max_lr
     torch._foreach_mul_(params, 1 -  wd_scale * weight_decay)
 
     # Decay the first and second moment running average coefficient
-    #torch._foreach_lerp_(exp_avgs, grads, 1 - beta1)
-    torch._foreach_mul_(exp_avgs, beta1)
-    torch._foreach_add_(exp_avgs, grads, alpha=1 - beta1)
+    _foreach_lerp_(exp_avgs, grads, 1 - beta1)
 
     torch._foreach_mul_(exp_avg_sqs, beta2)
     torch._foreach_addcmul_(exp_avg_sqs, grads, grads, 1 - beta2)
@@ -402,13 +431,16 @@ def _multi_tensor_adamw(
         else:
             denom_base = torch._foreach_sqrt(exp_avg_sqs)
 
-        torch._foreach_div_(
-            denom_base,
-            torch._foreach_mul(bias_correction2_sqrt, step_size)
-        )
-        eps_over_step_size = torch._foreach_div(step_size, eps)
-        torch._foreach_reciprocal_(eps_over_step_size)
-        denom = torch._foreach_add(denom_base, eps_over_step_size)
+        # add eps before dividing by the (negative) step size, as in the non-capturable path (see single-tensor)
+        torch._foreach_div_(denom_base, bias_correction2_sqrt)
+        torch._foreach_add_(denom_base, eps)
+        if clipping_threshold is not None:
+            _foreach_rms_clip_denom_(denom_base, grads, clipping_threshold)
+        # Promote FP16 to avoid overflow with small step sizes. Mixed dtypes make eager _foreach_addcdiv_
+        # fall back to per-tensor kernels; Inductor can fuse the cast and update under torch.compile.
+        denom_base = [d.float() if d.dtype == torch.float16 else d for d in denom_base]
+        torch._foreach_div_(denom_base, step_size)
+        denom = denom_base
 
         if caution:
             # Apply caution as per 'Cautious Optimizers' - https://arxiv.org/abs/2411.16085
@@ -422,6 +454,7 @@ def _multi_tensor_adamw(
 
         torch._foreach_addcdiv_(params, exp_avgs, denom)
     else:
+        lr = _get_value(lr)
         bias_correction1 = [1 - beta1 ** _get_value(step) for step in state_steps]
         bias_correction2 = [1 - beta2 ** _get_value(step) for step in state_steps]
 
@@ -439,6 +472,8 @@ def _multi_tensor_adamw(
 
         torch._foreach_div_(denom, bias_correction2_sqrt)
         torch._foreach_add_(denom, eps)
+        if clipping_threshold is not None:
+            _foreach_rms_clip_denom_(denom, grads, clipping_threshold)
 
         if caution:
             # Apply caution as per 'Cautious Optimizers' - https://arxiv.org/abs/2411.16085
@@ -450,8 +485,11 @@ def _multi_tensor_adamw(
             torch._foreach_div_(masks, mask_scale)
             exp_avgs = torch._foreach_mul(exp_avgs, masks)
 
-        # Fold the step sizes into the denominator. _foreach_div_ accepts the list
-        # of scalar tensors produced under torch.compile, while the ScalarList
-        # overload of _foreach_addcdiv_ does not.
-        torch._foreach_div_(denom, step_size)
-        torch._foreach_addcdiv_(params, exp_avgs, denom)
+        if _is_compiling():
+            # ScalarList addcdiv does not accept tensor step sizes under torch.compile.
+            # Promote FP16 to avoid overflow when folding in small step sizes; Inductor can fuse the cast.
+            denom = [d.float() if d.dtype == torch.float16 else d for d in denom]
+            torch._foreach_div_(denom, step_size)
+            torch._foreach_addcdiv_(params, exp_avgs, denom)
+        else:
+            torch._foreach_addcdiv_(params, exp_avgs, denom, step_size)

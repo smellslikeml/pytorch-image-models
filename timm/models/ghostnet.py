@@ -1,8 +1,13 @@
 """
 An implementation of GhostNet & GhostNetV2 Models as defined in:
-GhostNet: More Features from Cheap Operations. https://arxiv.org/abs/1911.11907
-GhostNetV2: Enhance Cheap Operation with Long-Range Attention. https://proceedings.neurips.cc/paper_files/paper/2022/file/40b60852a4abdaa696b5a1a78da34635-Paper-Conference.pdf
-GhostNetV3: Exploring the Training Strategies for Compact Models. https://arxiv.org/abs/2404.11202
+
+Papers:
+    * `GhostNet: More Features from Cheap Operations` - https://arxiv.org/abs/1911.11907
+    * `GhostNetV2: Enhance Cheap Operation with Long-Range Attention` - https://arxiv.org/abs/2211.12905
+    * `GhostNetV3: Exploring the Training Strategies for Compact Models` - https://arxiv.org/abs/2404.11202
+
+GhostNetV2 NeurIPS 2022 paper:
+https://proceedings.neurips.cc/paper_files/paper/2022/file/40b60852a4abdaa696b5a1a78da34635-Paper-Conference.pdf
 
 The train script & code of models at:
 Original model: https://github.com/huawei-noah/CV-backbones/tree/master/ghostnet_pytorch
@@ -19,12 +24,11 @@ import torch.nn.functional as F
 
 from timm.data import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
 from timm.layers import SelectAdaptivePool2d, Linear, make_divisible, get_device_dtype
-from timm.utils.model import reparameterize_model
 
 from ._builder import build_model_with_cfg
 from ._efficientnet_blocks import SqueezeExcite, ConvBnAct
 from ._features import feature_take_indices
-from ._manipulate import checkpoint_seq
+from ._manipulate import checkpoint_seq, reparameterize_model
 from ._registry import register_model, generate_default_cfgs
 
 __all__ = ['GhostNet']
@@ -703,11 +707,13 @@ class GhostNet(nn.Module):
         self.pool_dim = prev_chs = out_chs
 
         self.blocks = nn.Sequential(*stages)
+        self.stage_ends = [-1] + [int(info['module'].split('.')[-1]) for info in self.feature_info[1:]]
 
         # building last several layers
         self.num_features = prev_chs
         self.head_hidden_size = out_chs = 1280
         self.global_pool = SelectAdaptivePool2d(pool_type=global_pool)
+        assert self.global_pool.feat_mult() == 1, 'Pooling that changes the pooled width is not supported.'
         self.conv_head = nn.Conv2d(prev_chs, out_chs, 1, 1, 0, bias=True, **dd)
         self.act2 = nn.ReLU(inplace=True)
         self.flatten = nn.Flatten(1) if global_pool else nn.Identity()  # don't flatten if pooling disabled
@@ -738,11 +744,14 @@ class GhostNet(nn.Module):
     def get_classifier(self) -> nn.Module:
         return self.classifier
 
-    def reset_classifier(self, num_classes: int, global_pool: str = 'avg'):
+    def reset_classifier(self, num_classes: int, global_pool: Optional[str] = None):
         dd = get_device_dtype(self)
         self.num_classes = num_classes
+        if global_pool is None:
+            global_pool = self.global_pool.pool_type
         # cannot meaningfully change pooling of efficient head after creation
         self.global_pool = SelectAdaptivePool2d(pool_type=global_pool)
+        assert self.global_pool.feat_mult() == 1, 'Pooling that changes the pooled width is not supported.'
         self.global_pool.train(self.training)
         self.flatten = nn.Flatten(1) if global_pool else nn.Identity()  # don't flatten if pooling disabled
         self.flatten.train(self.training)
@@ -775,10 +784,9 @@ class GhostNet(nn.Module):
         """
         assert output_fmt in ('NCHW',), 'Output shape must be NCHW.'
         intermediates = []
-        stage_ends = [-1] + [int(info['module'].split('.')[-1]) for info in self.feature_info[1:]]
-        take_indices, max_index = feature_take_indices(len(stage_ends), indices)
-        take_indices = [stage_ends[i]+1 for i in take_indices]
-        max_index = stage_ends[max_index]
+        take_indices, max_index = feature_take_indices(len(self.stage_ends), indices)
+        take_indices = [self.stage_ends[i] + 1 for i in take_indices]
+        max_index = self.stage_ends[max_index]
 
         # forward pass
         feat_idx = 0
@@ -787,7 +795,8 @@ class GhostNet(nn.Module):
             intermediates.append(x)
         x = self.bn1(x)
         x = self.act1(x)
-        if torch.jit.is_scripting() or not stop_early:  # can't slice blocks in torchscript
+        # the blocks after the last tap (incl. the final conv) are part of the final features, run them if it's reached
+        if torch.jit.is_scripting() or not stop_early or max_index == self.stage_ends[-1]:  # can't slice in torchscript
             stages = self.blocks
         else:
             stages = self.blocks[:max_index + 1]
@@ -813,12 +822,24 @@ class GhostNet(nn.Module):
     ):
         """ Prune layers not required for specified intermediates.
         """
-        stage_ends = [-1] + [int(info['module'].split('.')[-1]) for info in self.feature_info[1:]]
-        take_indices, max_index = feature_take_indices(len(stage_ends), indices)
-        max_index = stage_ends[max_index]
+        take_indices, max_index = feature_take_indices(len(self.stage_ends), indices)
+        num_chs = self.feature_info[max_index]['num_chs']
+        max_index = self.stage_ends[max_index]
+        # the blocks after the last tap (incl. the final conv) never feed a tap, removed if blocks are truncated,
+        # or w/ the head or norm
+        if not (prune_norm or prune_head or max_index < self.stage_ends[-1]):
+            return take_indices
         self.blocks = self.blocks[:max_index + 1]  # truncate blocks w/ stem as idx 0
-        if prune_head:
-            self.reset_classifier(0, '')
+        if max_index < 0:
+            # the stem feature is the conv output, the norm + act after it are unused
+            self.bn1 = nn.Identity()
+            self.act1 = nn.Identity()
+        # features now end at the last kept tap, the head is sized for the final features so it goes too
+        self.num_features = self.head_hidden_size = num_chs
+        # the pre-logits conv is part of the head
+        self.conv_head = nn.Identity()
+        self.act2 = nn.Identity()
+        self.reset_classifier(0, '')
         return take_indices
 
     def forward_features(self, x: torch.Tensor) -> torch.Tensor:
@@ -846,7 +867,7 @@ class GhostNet(nn.Module):
         return x
 
     def convert_to_deploy(self):
-        reparameterize_model(self, inplace=False)
+        reparameterize_model(self, inplace=True)
 
 
 def checkpoint_filter_fn(state_dict: Dict[str, torch.Tensor], model: nn.Module) -> Dict[str, torch.Tensor]:

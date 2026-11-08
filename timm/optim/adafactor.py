@@ -11,10 +11,11 @@ Original header/copyright below.
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 import math
-from typing import Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 
+from ._helpers import _load_state_dict_preserving_dtypes
 from ._types import ParamsT
 
 
@@ -27,8 +28,10 @@ class Adafactor(torch.optim.Optimizer):
     Note that this optimizer internally adjusts the learning rate depending on the
     *scale_parameter*, *relative_step* and *warmup_init* options.
 
-    To use a manual (external) learning rate schedule you should set `scale_parameter=False` and
-    `relative_step=False`.
+    A manual (external) learning rate schedule is used when `lr` is set (`relative_step` is then False).
+    Note that in this implementation `scale_parameter` and `warmup_init` only apply to the relative step
+    learning rate (`lr=None`), unlike fairseq / HF Transformers, the parameter RMS scaling is not applied
+    to an external learning rate.
 
     Ags:
         params: iterable of parameters to optimize or dicts defining parameter groups
@@ -39,7 +42,7 @@ class Adafactor(torch.optim.Optimizer):
         decay_rate: coefficient used to compute running averages of square gradient
         beta1: coefficient used for computing running averages of gradient
         weight_decay: weight decay
-        scale_parameter: if True, learning rate is scaled by root-mean-square of parameter
+        scale_parameter: if True, relative step learning rate is scaled by root-mean-square of parameter
         warmup_init: time-dependent learning rate computation depends on whether warm-up initialization is being used
     """
 
@@ -58,7 +61,7 @@ class Adafactor(torch.optim.Optimizer):
             min_dim_size_to_factor: int = 16,
             caution: bool = False,
     ):
-        relative_step = not lr
+        relative_step = lr is None
         if warmup_init and not relative_step:
             raise ValueError('warmup_init requires relative_step=True')
 
@@ -84,6 +87,16 @@ class Adafactor(torch.optim.Optimizer):
         for group in self.param_groups:
             group.setdefault('caution', False)
             group.setdefault('min_dim_size_to_factor', 16)
+
+    def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
+        # state is kept in fp32 for low precision params (RMS is recomputed every step)
+        _load_state_dict_preserving_dtypes(
+            self, state_dict, super().load_state_dict,
+            lambda group, param: {
+                key: torch.float32 if param.dtype in {torch.float16, torch.bfloat16} else None
+                for key in ('exp_avg', 'exp_avg_sq', 'exp_avg_sq_row', 'exp_avg_sq_col')
+            },
+        )
 
     @staticmethod
     def _get_lr(param_group, param_state):
@@ -193,8 +206,8 @@ class Adafactor(torch.optim.Optimizer):
                     exp_avg_sq_row = state['exp_avg_sq_row']
                     exp_avg_sq_col = state['exp_avg_sq_col']
 
-                    exp_avg_sq_row.mul_(beta2t).add_(update.mean(dim=dim_row), alpha=1.0 - beta2t)
-                    exp_avg_sq_col.mul_(beta2t).add_(update.mean(dim=dim_col), alpha=1.0 - beta2t)
+                    exp_avg_sq_row.lerp_(update.mean(dim=dim_row), 1.0 - beta2t)
+                    exp_avg_sq_col.lerp_(update.mean(dim=dim_col), 1.0 - beta2t)
 
                     # Approximation of exponential moving average of square of gradient
                     update = self._approx_sq_grad(exp_avg_sq_row, exp_avg_sq_col, dim_col, dim_row)
@@ -202,7 +215,7 @@ class Adafactor(torch.optim.Optimizer):
                 else:
                     exp_avg_sq = state['exp_avg_sq']
 
-                    exp_avg_sq.mul_(beta2t).add_(update, alpha=1.0 - beta2t)
+                    exp_avg_sq.lerp_(update, 1.0 - beta2t)
                     update = exp_avg_sq.rsqrt().mul_(grad)
 
                 update.div_((self._rms(update) / group['clip_threshold']).clamp_(min=1.0))
@@ -210,7 +223,7 @@ class Adafactor(torch.optim.Optimizer):
 
                 if use_first_moment:
                     exp_avg = state['exp_avg']
-                    exp_avg.mul_(group['beta1']).add_(update, alpha=1 - group['beta1'])
+                    exp_avg.lerp_(update, 1 - group['beta1'])
                     if group['caution']:
                         # Apply caution as per 'Cautious Optimizers' - https://arxiv.org/abs/2411.16085
                         mask = (exp_avg * grad > 0).to(grad.dtype)

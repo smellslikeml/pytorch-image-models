@@ -1,6 +1,8 @@
 """ ViTamin
 
-Paper: Designing Scalable Vison Models in the Vision-Language Era
+Papers:
+    * `ViTamin: Designing Scalable Vision Models in the Vision-Language Era` - https://arxiv.org/abs/2404.02132
+
 A family of model weights on Huggingface: https://huggingface.co/collections/jienengchen/vitamin-family-661048126b72debdaca060bf
 
 @inproceedings{chen2024vitamin,
@@ -291,12 +293,16 @@ class GeGluMlp(nn.Module):
         self.w0 = nn.Linear(in_features, hidden_features, bias=bias, **dd)
         self.act = create_act_layer(act_layer)
         self.w1 = nn.Linear(in_features, hidden_features, bias=bias, **dd)
+        self.drop1 = nn.Dropout(drop)
         self.w2 = nn.Linear(hidden_features, in_features, bias=bias, **dd)
+        self.drop2 = nn.Dropout(drop)
 
     def forward(self, x):
         x = self.norm(x)
         x = self.act(self.w0(x)) * self.w1(x)
+        x = self.drop1(x)
         x = self.w2(x)
+        x = self.drop2(x)
         return x
 
 

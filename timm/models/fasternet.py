@@ -1,7 +1,9 @@
 """FasterNet
-Run, Don't Walk: Chasing Higher FLOPS for Faster Neural Networks
-- paper: https://arxiv.org/abs/2303.03667
-- code: https://github.com/JierunChen/FasterNet
+
+Papers:
+* `Run, Don't Walk: Chasing Higher FLOPS for Faster Neural Networks` - https://arxiv.org/abs/2303.03667
+
+Code: https://github.com/JierunChen/FasterNet
 
 @article{chen2023run,
   title={Run, Don't Walk: Chasing Higher FLOPS for Faster Neural Networks},
@@ -264,6 +266,7 @@ class FasterNet(nn.Module):
         self.num_features = prev_chs = int(embed_dim * 2 ** (self.num_stages - 1))
         self.head_hidden_size = out_chs = feature_dim # 1280
         self.global_pool = SelectAdaptivePool2d(pool_type=global_pool)
+        assert self.global_pool.feat_mult() == 1, 'Pooling that changes the pooled width is not supported.'
         self.conv_head = nn.Conv2d(prev_chs, out_chs, 1, 1, 0, bias=False, **dd)
         self.act = act_layer()
         self.flatten = nn.Flatten(1) if global_pool else nn.Identity()  # don't flatten if pooling disabled
@@ -306,11 +309,14 @@ class FasterNet(nn.Module):
     def get_classifier(self) -> nn.Module:
         return self.classifier
 
-    def reset_classifier(self, num_classes: int, global_pool: str = 'avg', device=None, dtype=None):
+    def reset_classifier(self, num_classes: int, global_pool: Optional[str] = None, device=None, dtype=None):
         dd = get_device_dtype(self, device=device, dtype=dtype)
         self.num_classes = num_classes
+        if global_pool is None:
+            global_pool = self.global_pool.pool_type
         # cannot meaningfully change pooling of efficient head after creation
         self.global_pool = SelectAdaptivePool2d(pool_type=global_pool)
+        assert self.global_pool.feat_mult() == 1, 'Pooling that changes the pooled width is not supported.'
         self.global_pool.train(self.training)
         self.flatten = nn.Flatten(1) if global_pool else nn.Identity()  # don't flatten if pooling disabled
         self.flatten.train(self.training)
@@ -368,8 +374,16 @@ class FasterNet(nn.Module):
         """ Prune layers not required for specified intermediates.
         """
         take_indices, max_index = feature_take_indices(len(self.stages), indices)
+        prune_end = max_index < len(self.stages) - 1
         self.stages = self.stages[:max_index + 1]  # truncate blocks w/ stem as idx 0
-        if prune_head:
+        if prune_end:
+            # features now end at the last kept tap, the head is sized for the final features so it goes too
+            self.num_features = self.feature_info[max_index]['num_chs']
+        if prune_head or prune_end:
+            # the pre-logits conv is part of the head
+            self.conv_head = nn.Identity()
+            self.act = nn.Identity()
+            self.head_hidden_size = self.num_features
             self.reset_classifier(0, '')
         return take_indices
 

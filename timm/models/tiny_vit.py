@@ -1,7 +1,7 @@
 """ TinyViT
 
-Paper: `TinyViT: Fast Pretraining Distillation for Small Vision Transformers`
-    - https://arxiv.org/abs/2207.10666
+Papers:
+* `TinyViT: Fast Pretraining Distillation for Small Vision Transformers` - https://arxiv.org/abs/2207.10666
 
 Adapted from official impl at https://github.com/microsoft/Cream/tree/main/TinyViT
 """
@@ -257,8 +257,12 @@ class Attention(torch.nn.Module):
     @torch.no_grad()
     def train(self, mode=True):
         super().train(mode)
-        if mode and self.attention_bias_cache:
+        if self.attention_bias_cache:
             self.attention_bias_cache = {}  # clear ab cache
+
+    def _apply(self, fn, *args, **kwargs):
+        self.attention_bias_cache = {}
+        return super()._apply(fn, *args, **kwargs)
 
     def get_attention_biases(self, device: torch.device) -> torch.Tensor:
         if torch.jit.is_tracing() or self.training:
@@ -518,6 +522,7 @@ class TinyVit(nn.Module):
             window_sizes: Tuple[int, ...] = (7, 7, 14, 7),
             mlp_ratio: float = 4.,
             drop_rate: float = 0.,
+            proj_drop_rate: float = 0.,
             drop_path_rate: float = 0.1,
             use_checkpoint: bool = False,
             mbconv_expand_ratio: float = 4.0,
@@ -571,7 +576,7 @@ class TinyVit(nn.Module):
                     num_heads=num_heads[stage_idx],
                     window_size=window_sizes[stage_idx],
                     mlp_ratio=self.mlp_ratio,
-                    drop=drop_rate,
+                    drop=proj_drop_rate,
                     local_conv_size=local_conv_size,
                     drop_path=drop_path_rate,
                     downsample=PatchMerging,
@@ -584,7 +589,7 @@ class TinyVit(nn.Module):
             self.feature_info += [dict(num_chs=prev_dim, reduction=stride, module=f'stages.{stage_idx}')]
 
         # Classifier head
-        self.num_features = self.head_hidden_size = embed_dims[-1]
+        self.num_features = embed_dims[-1]
 
         norm_layer_cf = partial(LayerNorm2d, eps=1e-5)
         self.head = NormMlpClassifierHead(
@@ -592,8 +597,10 @@ class TinyVit(nn.Module):
             num_classes,
             pool_type=global_pool,
             norm_layer=norm_layer_cf,
+            drop_rate=drop_rate,
             **dd,
         )
+        self.head_hidden_size = self.head.num_features
 
         # TODO: skip init when on meta device when safe to do so
         self.init_weights(needs_reset=False)
@@ -636,10 +643,17 @@ class TinyVit(nn.Module):
     def get_classifier(self) -> nn.Module:
         return self.head.fc
 
-    def reset_classifier(self, num_classes: int, global_pool: Optional[str] = None):
+    def reset_classifier(self, num_classes: int, global_pool: Optional[str] = None, reset_other: bool = False):
         dd = get_device_dtype(self)
         self.num_classes = num_classes
-        self.head.reset(num_classes, pool_type=global_pool, **dd)
+        self.head.reset(
+            num_classes,
+            pool_type=global_pool,
+            reset_other=reset_other,
+            in_features=self.num_features,
+            **dd,
+        )
+        self.head_hidden_size = self.head.num_features
 
     def forward_intermediates(
             self,
@@ -695,9 +709,13 @@ class TinyVit(nn.Module):
         """ Prune layers not required for specified intermediates.
         """
         take_indices, max_index = feature_take_indices(len(self.stages), indices)
+        prune_end = max_index < len(self.stages) - 1
         self.stages = self.stages[:max_index + 1]  # truncate blocks w/ stem as idx 0
-        if prune_head:
-            self.reset_classifier(0, '')
+        if prune_end:
+            # features now end at the last kept tap, the head is sized for the final features so it goes too
+            self.num_features = self.head_hidden_size = self.feature_info[max_index]['num_chs']
+        if prune_head or prune_end:
+            self.reset_classifier(0, '', reset_other=True)
         return take_indices
 
     def forward_features(self, x):

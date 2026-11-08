@@ -3,7 +3,6 @@
 Hacked together by / Copyright 2020 Ross Wightman
 """
 import fnmatch
-from copy import deepcopy
 
 import torch
 from torchvision.ops.misc import FrozenBatchNorm2d
@@ -142,7 +141,7 @@ def _freeze_unfreeze(root_module, submodules=[], include_bn_running_stats=True, 
     submodules = [root_module.get_submodule(m) for m in submodules]
 
     if not len(submodules):
-        named_modules, submodules = list(zip(*root_module.named_children()))
+        named_modules, submodules = [''], [root_module]
 
     for n, m in zip(named_modules, submodules):
         # (Un)freeze parameters
@@ -194,8 +193,9 @@ def freeze(root_module, submodules=[], include_bn_running_stats=True):
 
     Hint: If you want to freeze batch norm ONLY, use `timm.utils.model.freeze_batch_norm_2d`.
 
-    Examples::
+    Examples:
 
+        ```python
         >>> model = timm.create_model('resnet18')
         >>> # Freeze up to and including layer2
         >>> submodules = [n for n, _ in model.named_children()]
@@ -209,6 +209,7 @@ def freeze(root_module, submodules=[], include_bn_running_stats=True):
         True
         >>> # Unfreeze
         >>> unfreeze(model)
+        ```
     """
     _freeze_unfreeze(root_module, submodules, include_bn_running_stats=include_bn_running_stats, mode="freeze")
 
@@ -231,18 +232,7 @@ def unfreeze(root_module, submodules=[], include_bn_running_stats=True):
 
 
 def reparameterize_model(model: torch.nn.Module, inplace=False) -> torch.nn.Module:
-    if not inplace:
-        model = deepcopy(model)
-
-    def _fuse(m):
-        for child_name, child in m.named_children():
-            if hasattr(child, 'fuse'):
-                setattr(m, child_name, child.fuse())
-            elif hasattr(child, "reparameterize"):
-                child.reparameterize()
-            elif hasattr(child, "switch_to_deploy"):
-                child.switch_to_deploy()
-            _fuse(child)
-
-    _fuse(model)
-    return model
+    """Fuse / re-parameterize a model for inference, see ``timm.models.reparameterize_model``."""
+    # local import to avoid a circular import (timm.utils -> timm.models)
+    from timm.models._manipulate import reparameterize_model as _reparameterize_model
+    return _reparameterize_model(model, inplace=inplace)

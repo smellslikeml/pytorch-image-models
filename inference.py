@@ -18,10 +18,17 @@ import numpy as np
 import pandas as pd
 import torch
 
-from timm.data import create_dataset, create_loader, resolve_data_config, ImageNetInfo, infer_imagenet_subset, \
-    CustomDatasetInfo, DatasetInfoLabelMapper
+from timm.data import (
+    create_dataset,
+    create_loader,
+    resolve_input_data_config,
+    ImageNetInfo,
+    infer_imagenet_subset,
+    CustomDatasetInfo,
+    DatasetInfoLabelMapper,
+)
 from timm.layers import apply_test_time_pool
-from timm.models import create_model
+from timm.models import create_model, parse_model_name, resolve_model_input_args
 from timm.utils import AverageMeter, setup_default_logging, set_jit_fuser, ParseKwargs
 
 try:
@@ -35,7 +42,8 @@ has_compile = hasattr(torch, 'compile')
 
 _FMT_EXT = {
     'json': '.json',
-    'json-record': '.json',
+    'json-records': '.json',
+    'json-record': '.json',  # alias of json-records, kept for backwards compat
     'json-split': '.json',
     'parquet': '.parquet',
     'csv': '.csv',
@@ -121,7 +129,7 @@ parser.add_argument('--results-dir', type=str, default=None,
 parser.add_argument('--results-file', type=str, default=None,
                     help='results filename (relative to results-dir)')
 parser.add_argument('--results-format', type=str, nargs='+', default=['csv'],
-                    help='results format (one of "csv", "json", "json-split", "parquet")')
+                    help='results format (one of "csv", "json", "json-records", "json-split", "parquet")')
 parser.add_argument('--results-separate-col', action='store_true', default=False,
                     help='separate output columns per result index.')
 parser.add_argument('--topk', default=1, type=int,
@@ -180,19 +188,15 @@ def main():
         set_jit_fuser(args.fuser)
 
     # create model
-    in_chans = 3
-    if args.in_chans is not None:
-        in_chans = args.in_chans
-    elif args.input_size is not None:
-        in_chans = args.input_size[0]
-
     model = create_model(
-        args.model,
-        num_classes=args.num_classes,
-        in_chans=in_chans,
-        pretrained=args.pretrained,
-        checkpoint_path=args.checkpoint,
-        **args.model_kwargs,
+        **resolve_model_input_args(
+            args.model,
+            vars(args),
+            num_classes=args.num_classes,
+            pretrained=args.pretrained,
+            checkpoint_path=args.checkpoint,
+            **args.model_kwargs,
+        )
     )
     if args.num_classes is None:
         assert hasattr(model, 'num_classes'), 'Model must have `num_classes` attr if not set on cmd line/config.'
@@ -204,7 +208,7 @@ def main():
     _logger.info(
         f'Model {args.model} created, param count: {sum([m.numel() for m in model.parameters()])}')
 
-    data_config = resolve_data_config(vars(args), model=model)
+    data_config = resolve_input_data_config(model, vars(args), use_test_size=not args.use_train_size)
     test_time_pool = False
     if args.test_pool:
         model, test_time_pool = apply_test_time_pool(model, data_config)
@@ -354,20 +358,39 @@ def main():
             # remove it as it will be added back
             results_filename = filename_no_ext
     else:
-        # base default filename on model name + img-size
+        # base default filename on model name + img-size, w/o any source prefix or path separators
         img_size = data_config["input_size"][1]
-        results_filename = f'{args.model}-{img_size}'
+        source, model_id = parse_model_name(args.model)
+        if source == 'local-dir':
+            # dir basename alone is often meaningless (checkpoint, final, ...), prefix w/ the architecture
+            dir_name = os.path.basename(os.path.normpath(model_id))
+            model_name = f"{pretrained_cfg.get('architecture', 'model')}-{dir_name}"
+        else:
+            # registry name incl. any pretrained tag, or hf-hub repo name w/o the owner
+            model_name = model_id.rsplit('/', 1)[-1]
+        results_filename = f'{model_name}-{img_size}'
 
     if args.results_dir:
         os.makedirs(args.results_dir, exist_ok=True)
         results_filename = os.path.join(args.results_dir, results_filename)
 
+    unique_names = df[args.filename_col].is_unique
+    if not unique_names:
+        # e.g. the same basename in different class folders, use --fullname to disambiguate
+        _logger.warning(
+            f'Sample names in "{args.filename_col}" are not unique (use --fullname), '
+            'json results will be written as a list of records instead of keyed by name.'
+        )
+
     for fmt in args.results_format:
-        save_results(df, results_filename, fmt)
+        save_results(df, results_filename, fmt, filename_col=args.filename_col)
 
     if not args.no_console_results:
         print(f'--result')
-        print(df.set_index(args.filename_col).to_json(orient='index', indent=4))
+        if unique_names:
+            print(df.set_index(args.filename_col).to_json(orient='index', indent=4))
+        else:
+            print(df.to_json(orient='records', indent=4))
 
 
 def save_results(df, results_filename, results_format='csv', filename_col='filename'):
@@ -376,8 +399,12 @@ def save_results(df, results_filename, results_format='csv', filename_col='filen
     if results_format == 'parquet':
         df.set_index(filename_col).to_parquet(results_filename)
     elif results_format == 'json':
-        df.set_index(filename_col).to_json(results_filename, indent=4, orient='index')
-    elif results_format == 'json-records':
+        if df[filename_col].is_unique:
+            df.set_index(filename_col).to_json(results_filename, indent=4, orient='index')
+        else:
+            # orient='index' requires unique names, fall back to records
+            df.to_json(results_filename, indent=4, orient='records')
+    elif results_format in ('json-records', 'json-record'):
         df.to_json(results_filename, lines=True, orient='records')
     elif results_format == 'json-split':
         df.to_json(results_filename, indent=4, orient='split', index=False)
