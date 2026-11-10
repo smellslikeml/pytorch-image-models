@@ -25,9 +25,6 @@ name: Outrider
 # refiner dispatches its promotions).
 
 on:
-  schedule:
-    # Daily at 14:00 UTC
-    - cron: '0 14 * * *'
   workflow_dispatch:
     inputs:
       agent:
