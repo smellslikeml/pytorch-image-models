@@ -1,3 +1,4 @@
+from .adaptvig import *
 from .beit import *
 from .byoanet import *
 from .byobnet import *
